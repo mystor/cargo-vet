@@ -1971,7 +1971,10 @@ fn find_cargo_registry() -> Result<CargoRegistry, crates_index::Error> {
     // ERRORS: all of this is genuinely fallible internal workings
     // but if these path adjustments don't work then something is very fundamentally wrong
 
-    let index = CratesIndex::new_cargo_default()?;
+    // NOTE: This intentionally hard-codes the git index, rather than respecting
+    // cargo config, as we don't support custom registries or registry overrides
+    // when performing audits.
+    let index = CratesIndex::from_url(crates_index::INDEX_GIT_URL)?;
 
     let base_dir = index.path().parent().unwrap().parent().unwrap().to_owned();
     let registry = index.path().file_name().unwrap().to_owned();

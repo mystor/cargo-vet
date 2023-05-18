@@ -130,7 +130,8 @@ fn reg_ver(pub_ver: u64) -> MockRegistryVersion {
 // `crates_index::Index` type, as it is used in place of that type in test
 // builds.
 impl MockIndex {
-    pub fn new_cargo_default() -> Result<Self, crates_index::Error> {
+    pub fn from_url(url: &str) -> Result<Self, crates_index::Error> {
+        assert_eq!(url, crates_index::INDEX_GIT_URL);
         Ok(Self {
             packages: [
                 ("root-package", vec![reg_ver(DEFAULT_VER)]),
