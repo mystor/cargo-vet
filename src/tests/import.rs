@@ -3,7 +3,7 @@ use super::*;
 // Helper function for imports tests. Performs a vet and updates imports based
 // on it, returning a diff of the two.
 fn get_imports_file_changes(
-    metadata: &Metadata,
+    metadata: &PackageGraph,
     store: &Store,
     mode: impl FnMut(PackageStr<'_>) -> crate::resolver::UpdateMode,
 ) -> String {
@@ -26,7 +26,7 @@ fn get_imports_file_changes(
     generate_diff(&old_imports, &new_imports)
 }
 
-fn get_imports_file_changes_prune(metadata: &Metadata, store: &Store) -> String {
+fn get_imports_file_changes_prune(metadata: &PackageGraph, store: &Store) -> String {
     get_imports_file_changes(metadata, store, |_| crate::resolver::UpdateMode {
         search_mode: crate::resolver::SearchMode::PreferExemptions,
         prune_exemptions: false,
@@ -35,7 +35,7 @@ fn get_imports_file_changes_prune(metadata: &Metadata, store: &Store) -> String 
     })
 }
 
-fn get_imports_file_changes_noprune(metadata: &Metadata, store: &Store) -> String {
+fn get_imports_file_changes_noprune(metadata: &PackageGraph, store: &Store) -> String {
     get_imports_file_changes(metadata, store, |_| crate::resolver::UpdateMode {
         search_mode: crate::resolver::SearchMode::PreferExemptions,
         prune_exemptions: false,

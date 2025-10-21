@@ -1,15 +1,14 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
-    fmt,
-    fmt::Write,
+    fmt::{self, Write},
     fs, io,
     path::PathBuf,
     sync::{Arc, Mutex},
 };
 
-use cargo_metadata::{semver, Metadata};
 use clap::Parser;
+use guppy::graph::{cargo::CargoResolverVersion, DependencyDirection, PackageGraph};
 use serde_json::{json, Value};
 
 use crate::{
@@ -41,7 +40,11 @@ macro_rules! assert_report_snapshot {
         assert_report_snapshot!($name, $metadata, $store, None);
     };
     ($name:expr, $metadata:expr, $store:expr, $network:expr) => {{
-        let report = $crate::resolver::resolve(&$metadata, None, &$store);
+        let report = $crate::resolver::resolve(
+            &$metadata,
+            guppy::graph::cargo::CargoResolverVersion::V2,
+            &$store,
+        );
         let (human, json) = $crate::tests::get_reports(&$metadata, report, &$store, $network);
         insta::assert_snapshot!($name, human);
         insta::assert_snapshot!(concat!($name, ".json"), json);
@@ -118,11 +121,7 @@ struct MockPackage {
     targets: Vec<&'static str>,
     is_workspace: bool,
     is_first_party: bool,
-}
-
-struct MockDependency {
-    name: &'static str,
-    version: VetVersion,
+    features: BTreeMap<&'static str, Vec<&'static str>>,
 }
 
 impl Default for MockPackage {
@@ -136,13 +135,34 @@ impl Default for MockPackage {
             targets: vec!["lib"],
             is_workspace: false,
             is_first_party: false,
+            features: BTreeMap::new(),
+        }
+    }
+}
+
+struct MockDependency {
+    name: &'static str,
+    version: VetVersion,
+    optional: bool,
+    uses_default_features: bool,
+    features: Vec<&'static str>,
+}
+
+impl Default for MockDependency {
+    fn default() -> Self {
+        Self {
+            name: "",
+            version: ver(DEFAULT_VER),
+            optional: false,
+            uses_default_features: true,
+            features: vec![],
         }
     }
 }
 
 fn ver(major: u64) -> VetVersion {
     VetVersion {
-        semver: semver::Version {
+        semver: guppy::Version {
             major,
             minor: 0,
             patch: 0,
@@ -161,6 +181,9 @@ fn dep_ver(name: &'static str, version: u64) -> MockDependency {
     MockDependency {
         name,
         version: ver(version),
+        optional: false,
+        uses_default_features: true,
+        features: Vec::new(),
     }
 }
 
@@ -439,6 +462,32 @@ fn criteria_implies(
     }
 }
 
+const MOCK_WORKSPACE: &str = "MOCK_WORKSPACE";
+const MOCK_REGISTRY: &str = "MOCK_REGISTRY";
+
+// NOTE: The `guppy` crate relies on the ability to perform path comparisons
+// between paths, which means we cannot use the same paths on all platforms
+// in the input JSON.
+fn mock_path<'a>(segments: impl IntoIterator<Item = &'a str>) -> String {
+    #[cfg(windows)]
+    const BASE_PATH: &str = "C:\\";
+    #[cfg(not(windows))]
+    const BASE_PATH: &str = "/";
+
+    let path: PathBuf = [BASE_PATH].into_iter().chain(segments).collect();
+    path.into_os_string().into_string().unwrap()
+}
+
+fn mock_path_to_file_url(path: &str) -> String {
+    if cfg!(windows) {
+        // NOTE: Windows has an extra leading `/` before the `C:` which is
+        // not present on other platforms.
+        format!("file:///{}", path.replace('\\', "/"))
+    } else {
+        format!("file://{}", path)
+    }
+}
+
 impl MockMetadata {
     fn simple() -> Self {
         // A simple dependency tree to test basic functionality on.
@@ -503,6 +552,7 @@ impl MockMetadata {
                         version: "10.0.0@git:00112233445566778899aabbccddeeff00112233"
                             .parse()
                             .unwrap(),
+                        ..Default::default()
                     },
                     dep("third-party2"),
                 ],
@@ -650,6 +700,7 @@ impl MockMetadata {
                 deps: vec![dep("normal"), dep("proc-macro")],
                 dev_deps: vec![dep("dev"), dep("dev-proc-macro")],
                 build_deps: vec![dep("build"), dep("build-proc-macro")],
+                targets: vec!["lib", "custom-build"],
                 ..Default::default()
             },
             MockPackage {
@@ -713,6 +764,7 @@ impl MockMetadata {
                 is_first_party: true,
                 deps: vec![dep("normal"), dep("both")],
                 dev_deps: vec![dep("dev-cycle-direct"), dep("both"), dep("simple-dev")],
+                targets: vec!["lib", "custom-build"],
                 ..Default::default()
             },
             MockPackage {
@@ -773,6 +825,82 @@ impl MockMetadata {
         ])
     }
 
+    fn feature_tree() -> Self {
+        // A tree with multiple roots depending on the same package but with different features.
+        // Each feature in the shared package pulls in a different third-party dependency.
+        //
+        //                root-a    root-b
+        //                [f1] \    / [f2]
+        //                     shared  --[f3]-- third3
+        //                [f1] /    \ [f2]
+        //                    /      \
+        //               third-1    third-2
+        //
+        MockMetadata::new(vec![
+            MockPackage {
+                name: "root-a",
+                is_workspace: true,
+                is_first_party: true,
+                deps: vec![MockDependency {
+                    name: "shared",
+                    features: vec!["feature1"],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            MockPackage {
+                name: "root-b",
+                is_workspace: true,
+                is_first_party: true,
+                deps: vec![MockDependency {
+                    name: "shared",
+                    features: vec!["feature2"],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            MockPackage {
+                name: "shared",
+                deps: vec![
+                    MockDependency {
+                        name: "third-1",
+                        optional: true,
+                        ..Default::default()
+                    },
+                    MockDependency {
+                        name: "third-2",
+                        optional: true,
+                        ..Default::default()
+                    },
+                    MockDependency {
+                        name: "third-3",
+                        optional: true,
+                        ..Default::default()
+                    },
+                ],
+                features: [
+                    ("feature1", vec!["dep:third-1"]),
+                    ("feature2", vec!["dep:third-2"]),
+                    ("feature3", vec!["dep:third-3"]),
+                ]
+                .into(),
+                ..Default::default()
+            },
+            MockPackage {
+                name: "third-1",
+                ..Default::default()
+            },
+            MockPackage {
+                name: "third-2",
+                ..Default::default()
+            },
+            MockPackage {
+                name: "third-3",
+                ..Default::default()
+            },
+        ])
+    }
+
     fn descriptive() -> Self {
         MockMetadata::new(vec![MockPackage {
             name: "descriptive",
@@ -788,10 +916,9 @@ impl MockMetadata {
 
         for (idx, package) in packages.iter().enumerate() {
             let pkgid = if package.is_first_party {
-                format!(
-                    "{} {} (path+file:///C:/FAKE/{})",
-                    package.name, package.version, package.name
-                )
+                let ws_path = mock_path([MOCK_WORKSPACE, package.name]);
+                let url = mock_path_to_file_url(&ws_path);
+                format!("{} {} (path+{})", package.name, package.version, url)
             } else if let Some(git_rev) = &package.version.git_rev {
                 format!(
                     "{} {} (git+https://github.com/owner/{}#{})",
@@ -845,58 +972,129 @@ impl MockMetadata {
         }
     }
 
-    fn metadata(&self) -> Metadata {
-        let meta_json = json!({
-            "packages": self.packages.iter().map(|package| json!({
-                "name": package.name,
-                "version": package.version.semver.to_string(),
-                "id": self.pkgid(package),
-                "license": "MIT",
-                "license_file": null,
-                "description": "whatever",
-                "source": self.source(package),
-                "dependencies": package.deps.iter().chain(&package.dev_deps).chain(&package.build_deps).map(|dep| json!({
+    fn make_ident(&self, name: PackageStr) -> String {
+        name.replace('-', "_")
+    }
+
+    fn package_metadata_json(&self, package: &MockPackage) -> serde_json::Value {
+        let mock_base_path = if package.is_workspace {
+            MOCK_WORKSPACE
+        } else {
+            MOCK_REGISTRY
+        };
+
+        let dependencies = package
+            .deps
+            .iter()
+            .map(|dep| (dep, None))
+            .chain(package.dev_deps.iter().map(|dep| (dep, Some("dev"))))
+            .chain(package.build_deps.iter().map(|dep| (dep, Some("build"))))
+            .map(|(dep, kind)| {
+                json!({
                     "name": dep.name,
                     "source": self.source(self.package_by(dep.name, &dep.version)),
                     "req": format!("={}", dep.version.semver),
-                    "kind": null,
+                    "kind": kind,
                     "rename": null,
-                    "optional": false,
-                    "uses_default_features": true,
-                    "features": [],
+                    "optional": dep.optional,
+                    "uses_default_features": dep.uses_default_features,
+                    "features": dep.features,
                     "target": null,
                     "registry": null
-                })).collect::<Vec<_>>(),
-                "targets": package.targets.iter().map(|target| json!({
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let targets = package
+            .targets
+            .iter()
+            .map(|target| {
+                json!({
                     "kind": [
                         target
                     ],
                     "crate_types": [
-                        target
+                        if *target == "custom-build" { "bin" } else { *target }
                     ],
-                    "name": package.name,
-                    "src_path": "C:\\Users\\fake_user\\.cargo\\registry\\src\\github.com-1ecc6299db9ec823\\DUMMY\\src\\lib.rs",
+                    "name": if *target == "custom-build" {
+                        "build-script-build".to_owned()
+                    } else {
+                        self.make_ident(package.name)
+                    },
+                    "src_path": mock_path([mock_base_path, package.name, "src", "lib.rs"]),
                     "edition": "2015",
                     "doc": true,
                     "doctest": true,
                     "test": true
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json!({
+            "name": package.name,
+            "version": package.version.semver.to_string(),
+            "id": self.pkgid(package),
+            "license": null,
+            "license_file": null,
+            "description": "whatever",
+            "source": self.source(package),
+            "dependencies": dependencies,
+            "targets": targets,
+            "features": package.features,
+            "manifest_path": mock_path([mock_base_path, package.name, "Cargo.toml"]),
+            "metadata": null,
+            "publish": null,
+            "authors": [],
+            "categories": [],
+            "keywords": [],
+            "readme": "README.md",
+            "repository": null,
+            "homepage": null,
+            "documentation": null,
+            "edition": "2015",
+            "links": null,
+            "default_run": null,
+            "rust_version": null
+        })
+    }
+
+    fn resolve_node_metadata_json(&self, package: &MockPackage) -> serde_json::Value {
+        let mut all_deps = BTreeMap::<(PackageStr, &VetVersion), Vec<Option<&str>>>::new();
+        for dep in &package.deps {
+            all_deps
+                .entry((dep.name, &dep.version))
+                .or_default()
+                .push(None);
+        }
+        for dep in &package.build_deps {
+            all_deps
+                .entry((dep.name, &dep.version))
+                .or_default()
+                .push(Some("build"));
+        }
+        for dep in &package.dev_deps {
+            all_deps
+                .entry((dep.name, &dep.version))
+                .or_default()
+                .push(Some("dev"));
+        }
+        json!({
+            "id": self.pkgid(package),
+            "dependencies": all_deps.keys().map(|(name, version)| self.pkgid_by(name, version)).collect::<Vec<_>>(),
+            "deps": all_deps.iter().map(|((name, version), kinds)| json!({
+                "name": self.make_ident(name),
+                "pkg": self.pkgid_by(name, version),
+                "dep_kinds": kinds.iter().map(|kind| json!({
+                    "kind": kind,
+                    "target": null,
                 })).collect::<Vec<_>>(),
-                "features": {},
-                "manifest_path": "C:\\Users\\fake_user\\.cargo\\registry\\src\\github.com-1ecc6299db9ec823\\DUMMY\\Cargo.toml",
-                "metadata": null,
-                "publish": null,
-                "authors": [],
-                "categories": [],
-                "keywords": [],
-                "readme": "README.md",
-                "repository": null,
-                "homepage": null,
-                "documentation": null,
-                "edition": "2015",
-                "links": null,
-                "default_run": null,
-                "rust_version": null
             })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn metadata_json(&self) -> serde_json::Value {
+        json!({
+            "packages": self.packages.iter().map(|package| self.package_metadata_json(package)).collect::<Vec<_>>(),
             "workspace_members": self.packages.iter().filter_map(|package| {
                 if package.is_workspace {
                     Some(self.pkgid(package))
@@ -905,43 +1103,26 @@ impl MockMetadata {
                 }
             }).collect::<Vec<_>>(),
             "resolve": {
-                "nodes": self.packages.iter().map(|package| {
-                    let mut all_deps = BTreeMap::<(PackageStr, &VetVersion), Vec<Option<&str>>>::new();
-                    for dep in &package.deps {
-                        all_deps.entry((dep.name, &dep.version)).or_default().push(None);
-                    }
-                    for dep in &package.build_deps {
-                        all_deps.entry((dep.name, &dep.version)).or_default().push(Some("build"));
-                    }
-                    for dep in &package.dev_deps {
-                        all_deps.entry((dep.name, &dep.version)).or_default().push(Some("dev"));
-                    }
-                    json!({
-                        "id": self.pkgid(package),
-                        "dependencies": all_deps.keys().map(|(name, version)| self.pkgid_by(name, version)).collect::<Vec<_>>(),
-                        "deps": all_deps.iter().map(|((name, version), kinds)| json!({
-                            "name": name,
-                            "pkg": self.pkgid_by(name, version),
-                            "dep_kinds": kinds.iter().map(|kind| json!({
-                                "kind": kind,
-                                "target": null,
-                            })).collect::<Vec<_>>(),
-                        })).collect::<Vec<_>>(),
-                    })
-                }).collect::<Vec<_>>(),
+                "nodes": self.packages.iter().map(|package| self.resolve_node_metadata_json(package)).collect::<Vec<_>>(),
                 "root": null,
             },
-            "target_directory": "C:\\FAKE\\target",
+            "target_directory": mock_path([MOCK_WORKSPACE, "target"]),
             "version": 1,
-            "workspace_root": "C:\\FAKE\\",
+            "workspace_root": mock_path([MOCK_WORKSPACE]),
             "metadata": null,
-        });
-        serde_json::from_value(meta_json).unwrap()
+        })
+    }
+
+    // NOTE: This is called `metadata` as previously it returned a
+    // `cargo_metadata::Metadata` object. It has not been re-named to reduce
+    // test churn.
+    fn metadata(&self) -> PackageGraph {
+        PackageGraph::from_json(serde_json::to_string(&self.metadata_json()).unwrap()).unwrap()
     }
 }
 
 fn init_files(
-    metadata: &Metadata,
+    metadata: &PackageGraph,
     criteria: impl IntoIterator<Item = (CriteriaName, CriteriaEntry)>,
     default_criteria: &str,
 ) -> (ConfigFile, AuditsFile, ImportsFile) {
@@ -966,21 +1147,20 @@ fn init_files(
 
     // Make the root packages use our custom criteria instead of the builtins
     if default_criteria != SAFE_TO_DEPLOY {
-        for pkgid in &metadata.workspace_members {
-            for package in &metadata.packages {
-                if package.id == *pkgid {
-                    config.policy.insert(
-                        package.name.to_string(),
-                        PackagePolicyEntry::Unversioned(PolicyEntry {
-                            audit_as_crates_io: None,
-                            criteria: Some(vec![default_criteria.to_string().into()]),
-                            dev_criteria: Some(vec![default_criteria.to_string().into()]),
-                            dependency_criteria: CriteriaMap::new(),
-                            notes: None,
-                        }),
-                    );
-                }
-            }
+        for package in metadata
+            .resolve_workspace()
+            .root_packages(DependencyDirection::Forward)
+        {
+            config.policy.insert(
+                package.name().to_string(),
+                PackagePolicyEntry::Unversioned(PolicyEntry {
+                    audit_as_crates_io: None,
+                    criteria: Some(vec![default_criteria.to_string().into()]),
+                    dev_criteria: None, // Some(vec![default_criteria.to_string().into()]),
+                    dependency_criteria: CriteriaMap::new(),
+                    notes: None,
+                }),
+            );
         }
     }
 
@@ -1000,7 +1180,7 @@ fn init_files(
     (store.config, store.audits, store.imports)
 }
 
-fn files_inited(metadata: &Metadata) -> (ConfigFile, AuditsFile, ImportsFile) {
+fn files_inited(metadata: &PackageGraph) -> (ConfigFile, AuditsFile, ImportsFile) {
     // Criteria hierarchy:
     //
     // * strong-reviewed
@@ -1029,7 +1209,7 @@ fn files_inited(metadata: &Metadata) -> (ConfigFile, AuditsFile, ImportsFile) {
     )
 }
 
-fn files_no_exemptions(metadata: &Metadata) -> (ConfigFile, AuditsFile, ImportsFile) {
+fn files_no_exemptions(metadata: &PackageGraph) -> (ConfigFile, AuditsFile, ImportsFile) {
     let (mut config, audits, imports) = files_inited(metadata);
 
     // Just clear all the exemptions out
@@ -1038,14 +1218,14 @@ fn files_no_exemptions(metadata: &Metadata) -> (ConfigFile, AuditsFile, ImportsF
     (config, audits, imports)
 }
 
-fn files_full_audited(metadata: &Metadata) -> (ConfigFile, AuditsFile, ImportsFile) {
+fn files_full_audited(metadata: &PackageGraph) -> (ConfigFile, AuditsFile, ImportsFile) {
     let (config, mut audits, imports) = files_no_exemptions(metadata);
 
     let mut audited = SortedMap::<PackageName, Vec<AuditEntry>>::new();
-    for package in &metadata.packages {
+    for package in metadata.packages() {
         if package.is_third_party(&config.policy) {
             audited
-                .entry(package.name.to_string())
+                .entry(package.name().to_string())
                 .or_default()
                 .push(full_audit(package.vet_version(), DEFAULT_CRIT));
         }
@@ -1055,11 +1235,11 @@ fn files_full_audited(metadata: &Metadata) -> (ConfigFile, AuditsFile, ImportsFi
     (config, audits, imports)
 }
 
-fn builtin_files_inited(metadata: &Metadata) -> (ConfigFile, AuditsFile, ImportsFile) {
+fn builtin_files_inited(metadata: &PackageGraph) -> (ConfigFile, AuditsFile, ImportsFile) {
     init_files(metadata, [], SAFE_TO_DEPLOY)
 }
 
-fn builtin_files_no_exemptions(metadata: &Metadata) -> (ConfigFile, AuditsFile, ImportsFile) {
+fn builtin_files_no_exemptions(metadata: &PackageGraph) -> (ConfigFile, AuditsFile, ImportsFile) {
     let (mut config, audits, imports) = builtin_files_inited(metadata);
 
     // Just clear all the exemptions out
@@ -1067,14 +1247,14 @@ fn builtin_files_no_exemptions(metadata: &Metadata) -> (ConfigFile, AuditsFile, 
 
     (config, audits, imports)
 }
-fn builtin_files_full_audited(metadata: &Metadata) -> (ConfigFile, AuditsFile, ImportsFile) {
+fn builtin_files_full_audited(metadata: &PackageGraph) -> (ConfigFile, AuditsFile, ImportsFile) {
     let (config, mut audits, imports) = builtin_files_no_exemptions(metadata);
 
     let mut audited = SortedMap::<PackageName, Vec<AuditEntry>>::new();
-    for package in &metadata.packages {
+    for package in metadata.packages() {
         if package.is_third_party(&config.policy) {
             audited
-                .entry(package.name.to_string())
+                .entry(package.name().to_string())
                 .or_default()
                 .push(full_audit(package.vet_version(), SAFE_TO_DEPLOY));
         }
@@ -1083,7 +1263,7 @@ fn builtin_files_full_audited(metadata: &Metadata) -> (ConfigFile, AuditsFile, I
 
     (config, audits, imports)
 }
-fn builtin_files_minimal_audited(metadata: &Metadata) -> (ConfigFile, AuditsFile, ImportsFile) {
+fn builtin_files_minimal_audited(metadata: &PackageGraph) -> (ConfigFile, AuditsFile, ImportsFile) {
     let (mut config, mut audits, imports) = builtin_files_inited(metadata);
 
     let mut audited = SortedMap::<PackageName, Vec<AuditEntry>>::new();
@@ -1128,11 +1308,11 @@ fn mock_today() -> chrono::NaiveDate {
     mock_now().date_naive()
 }
 
-fn mock_cfg(metadata: &Metadata) -> Config {
+fn mock_cfg(metadata: &PackageGraph) -> Config {
     mock_cfg_args(metadata, ["cargo", "vet"])
 }
 
-fn mock_cfg_args<I, T>(metadata: &Metadata, itr: I) -> Config
+fn mock_cfg_args<I, T>(metadata: &PackageGraph, itr: I) -> Config
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
@@ -1141,7 +1321,8 @@ where
         crate::cli::FakeCli::try_parse_from(itr).expect("Parsing arguments for mock_cfg failed!");
     Config {
         metacfg: MetaConfig(vec![]),
-        metadata: metadata.clone(),
+        package_graph: metadata.clone(),
+        resolver_version: CargoResolverVersion::V2,
         _rest: PartialConfig {
             cli,
             now: mock_now(),
@@ -1152,7 +1333,7 @@ where
 }
 
 fn get_reports(
-    metadata: &Metadata,
+    metadata: &PackageGraph,
     report: ResolveReport,
     store: &Store,
     network: Option<&Network>,
@@ -1291,7 +1472,7 @@ fn diff_store_commits(old: &SortedMap<String, String>, new: &SortedMap<String, S
 
 #[derive(Clone)]
 struct MockRegistryVersion {
-    version: semver::Version,
+    version: guppy::Version,
     published_by: Option<CratesUserId>,
     trustpub: Option<CratesAPITrustpubData>,
     created_at: chrono::DateTime<chrono::Utc>,

@@ -1,5 +1,11 @@
 # Unreleased
 
+* **BREAKING CHANGE** Re-implemented the crate graph backend with [`guppy`](https://github.com/guppy-rs/guppy).
+  * Dependency resolution now reflects resolver v2 crate feature unification more accurately. A package which is built through two independent targets with different features should now reflect the actual features used by `cargo build` when propagating criteria requirements to dependencies.
+  * **BREAKING CHANGE** Removed the `dump-graph` subcommand, as we now use `guppy`'s more complex build graph representation.
+  * **BREAKING CHANGE** Removed the `--filter-graph` command line flag, as it no longer makes sense with `guppy`'s more complex build graph representation.
+  * **BREAKING CHANGE** Removed the `--no-all-features`, `--no-default-features` and `--features` command line flags, as `guppy` requires that the cargo metadata be built with all features present.
+  * **BREAKING CHANGE** Specific criteria requirements in edge cases (especially around multi-root crate graphs), has changed. This may reduce or increase the audit requirements on dependencies.
 * Added support for declaring wildcard audits and trusted entries for crates published using ["Trusted Publishing"](https://crates.io/docs/trusted-publishing) (#671)
 * `cargo vet check --frozen` (a disabled network) will infer the existence of crates using versions
   in audits when checking audit-as-crates-io policies (#661)

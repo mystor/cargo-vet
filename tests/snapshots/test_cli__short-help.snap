@@ -24,7 +24,6 @@ Commands:
   prune             Prune unnecessary imports and exemptions
   aggregate         Fetch and merge audits from multiple sources into a single `audits.toml` file
   explain-audit     Print the computed audit path used by cargo-vet to certify a package for a given critera
-  dump-graph        Print the cargo build graph as understood by `cargo vet`
   gc                Clean up old packages from the vet cache
   renew             Renew wildcard audit expirations
   help              Print this message or the help of the given subcommand(s)
@@ -36,9 +35,6 @@ Options:
 Global Options:
       --manifest-path <PATH>           Path to Cargo.toml
       --store-path <STORE_PATH>        Path to the supply-chain directory
-      --no-all-features                Don't use --all-features
-      --no-default-features            Do not activate the `default` feature
-      --features <FEATURES>            Space-separated list of features to activate
       --locked                         Do not fetch new imported audits
       --frozen                         Avoid the network entirely, requiring either that the cargo cache is populated or the dependencies are vendored. Requires --locked
       --no-minimize-exemptions         Prevent commands such as `check` and `certify` from automatically cleaning up unused exemptions
@@ -48,7 +44,6 @@ Global Options:
       --log-file <LOG_FILE>            Instead of stderr, write logs to this file (only used after successful CLI parsing)
       --output-format <OUTPUT_FORMAT>  The format of the output [default: human] [possible values: human, json]
       --cache-dir <CACHE_DIR>          Use the following path instead of the global cache directory
-      --filter-graph <FILTER_GRAPH>    Filter out different parts of the build graph and pretend that's the true graph
       --cargo-arg <CARGO_ARG>          Arguments to pass through to cargo. It can be specified multiple times for multiple arguments
 
 stderr:

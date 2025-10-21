@@ -17,14 +17,26 @@
 //!
 //! ## Resolve
 //!
-//! * construct the [`DepGraph`] and [`CriteriaMapper`]
-//!     * the DepGraph contains computed facts like whether a node is a third-party or dev-only
-//!       and includes a special topological sorting of the packages that prioritizes the normal
-//!       build over the dev build (it's complicated...)
+//! * construct the [`CriteriaMapper`] which maps criteria and their
+//!   dependencies to bitsets for faster operation during the rest of resolve.
 //!
-//! * resolve_requirements: for each package, resolve what criteria it needs to be audited for
-//!     * start with root targets and propagate requirements out towards leaf crates
-//!     * policies can override requirements on the target crate and its dependencies
+//! * resolve_requirements_for_build: simulate a cargo build config, applying required
+//!   audit criteria to each package
+//!     * simulate cargo's feature resolution with [`guppy::graph::cargo::CargoSet`]
+//!     * propagate audit requirements over enabled dependency edges based on
+//!       the computed feature resolution
+//!     * policies can override requirements on each crate and its dependencies
+//!     * results for target and host builds are merged into the overall
+//!       requirements table, which may be shared between multiple calls to
+//!       `resolve_requirements_for_build`
+//!
+//! * resolve_requirements: simulates multiple builds, merging them all together
+//!   to determine overall criteria requirements
+//!     * builds are simulated with `resolve_requirements_for_build` (see above)
+//!     * the full workspace is first "built" once with dev-dependencies
+//!       enabled, propagating dev-only criteria, then
+//!     * each root package is "built" without dev-dependencies,
+//!       propagating normal audit criteria.
 //!
 //! * resolve_audits: for each package, resolve what criteria it's audited for
 //!     * compute the [`AuditGraph`] and check for violations
@@ -40,17 +52,21 @@
 //!   existing set of criteria, to suggest the best audit and criteria which could
 //!   be used to allow the crate to vet successfully.
 
-use cargo_metadata::{DependencyKind, Metadata, Node, PackageId};
 use futures_util::future::join_all;
+use guppy::graph::cargo::{BuildPlatform, CargoOptions, CargoResolverVersion};
+use guppy::graph::feature::{FeatureLabel, FeatureSet, StandardFeatures};
+use guppy::graph::{DependencyDirection, PackageGraph, PackageLink, PackageMetadata};
+use guppy::platform::{EnabledTernary, PlatformSpec};
+use guppy::{DependencyKind, PackageId};
 use miette::IntoDiagnostic;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{hash_map, BinaryHeap};
 use std::sync::Arc;
-use tracing::{trace, trace_span, warn};
+use tracing::{debug, debug_span, trace, trace_span, warn};
 
-use crate::cli::{DumpGraphArgs, GraphFilter, GraphFilterProperty, GraphFilterQuery, OutputFormat};
+use crate::cli::OutputFormat;
 use crate::criteria::{CriteriaMapper, CriteriaSet};
 use crate::errors::SuggestError;
 use crate::format::{
@@ -67,51 +83,46 @@ use crate::storage::Cache;
 use crate::string_format::FormatShortList;
 use crate::{Config, PackageExt, Store};
 
-pub struct ResolveReport<'a> {
-    /// The Cargo dependency graph as parsed and understood by cargo-vet.
-    ///
-    /// All [`PackageIdx`][] values are indices into this graph's nodes.
-    pub graph: DepGraph<'a>,
-
+pub struct ResolveReport<'g> {
     /// Mappings between criteria names and CriteriaSets/Indices.
     pub criteria_mapper: CriteriaMapper,
 
     /// Low-level results for each package's individual criteria resolving
-    /// analysis, indexed by [`PackageIdx`][]. Will be `None` for first-party
+    /// analysis, indexed by [`PackageIdx`][]. Will be absent for first-party
     /// crates or crates with violation conflicts.
-    pub results: Vec<Option<ResolveResult>>,
+    pub results: FastMap<&'g PackageId, ResolveResult>,
 
     /// The final conclusion of our analysis.
-    pub conclusion: Conclusion,
+    pub conclusion: Conclusion<'g>,
 }
 
 #[derive(Debug)]
-pub enum Conclusion {
-    Success(Success),
-    FailForViolationConflict(FailForViolationConflict),
-    FailForVet(FailForVet),
+pub enum Conclusion<'g> {
+    Success(Success<'g>),
+    FailForViolationConflict(FailForViolationConflict<'g>),
+    FailForVet(FailForVet<'g>),
 }
 
 #[derive(Debug, Clone)]
-pub struct Success {
+pub struct Success<'g> {
     /// Third-party packages that were successfully vetted using only 'exemptions'
-    pub vetted_with_exemptions: Vec<PackageIdx>,
+    pub vetted_with_exemptions: Vec<PackageMetadata<'g>>,
     /// Third-party packages that were successfully vetted using both 'audits' and 'exemptions'
-    pub vetted_partially: Vec<PackageIdx>,
+    pub vetted_partially: Vec<PackageMetadata<'g>>,
     /// Third-party packages that were successfully vetted using only 'audits'
-    pub vetted_fully: Vec<PackageIdx>,
+    pub vetted_fully: Vec<PackageMetadata<'g>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct FailForViolationConflict {
-    pub violations: Vec<(PackageIdx, Vec<ViolationConflict>)>,
+pub struct FailForViolationConflict<'g> {
+    pub violations: Vec<(PackageMetadata<'g>, Vec<ViolationConflict>)>,
 }
 
 #[derive(Debug)]
-pub struct FailForVet {
+pub struct FailForVet<'g> {
     /// These packages are to blame and need to be fixed
-    pub failures: Vec<(PackageIdx, AuditFailure)>,
-    pub suggest: Option<Suggest>,
+    pub failures: Vec<(PackageMetadata<'g>, AuditFailure)>,
+    pub suggest: Option<Suggest<'g>>,
 }
 
 // FIXME: This format is pretty janky and unstable, so we probably should come
@@ -133,9 +144,9 @@ pub enum ViolationConflict {
 }
 
 #[derive(Debug, Default)]
-pub struct Suggest {
-    pub suggestions: Vec<SuggestItem>,
-    pub suggestions_by_criteria: SortedMap<CriteriaName, Vec<SuggestItem>>,
+pub struct Suggest<'g> {
+    pub suggestions: Vec<SuggestItem<'g>>,
+    pub suggestions_by_criteria: SortedMap<CriteriaName, Vec<SuggestItem<'g>>>,
     pub total_lines: u64,
     pub warnings: Vec<String>,
 }
@@ -148,8 +159,8 @@ pub struct TrustHint {
 }
 
 #[derive(Debug, Clone)]
-pub struct SuggestItem {
-    pub package: PackageIdx,
+pub struct SuggestItem<'g> {
+    pub package: PackageMetadata<'g>,
     pub suggested_criteria: CriteriaSet,
     pub suggested_diff: DiffRecommendation,
     pub notable_parents: Vec<String>,
@@ -171,55 +182,6 @@ pub struct RegistrySuggestion {
     pub name: ImportName,
     pub url: Vec<String>,
     pub diff: DiffRecommendation,
-}
-
-/// An "interned" cargo PackageId which is used to uniquely identify packages throughout
-/// the code. This is simpler and faster than actually using PackageIds (strings) or name+version.
-/// In the current implementation it can be used to directly index into the `graph` or `results`.
-pub type PackageIdx = usize;
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PackageNode<'a> {
-    #[serde(skip)]
-    /// The PackageId that cargo uses to uniquely identify this package
-    ///
-    /// This ID is not guaranteed to be stable across cargo versions, so is not
-    /// serialized into graph JSON.
-    ///
-    /// Prefer using a [`DepGraph`] and its memoized [`PackageIdx`]'s.
-    pub package_id: &'a PackageId,
-    /// The name of the package
-    pub name: PackageStr<'a>,
-    /// The version of this package
-    pub version: VetVersion,
-    /// All normal deps (shipped in the project or a proc-macro it uses)
-    pub normal_deps: Vec<PackageIdx>,
-    /// All build deps (used for build.rs)
-    pub build_deps: Vec<PackageIdx>,
-    /// All dev deps (used for tests/benches)
-    pub dev_deps: Vec<PackageIdx>,
-    /// Just the normal and build deps (deduplicated)
-    pub normal_and_build_deps: Vec<PackageIdx>,
-    /// All deps combined (deduplicated)
-    pub all_deps: Vec<PackageIdx>,
-    /// All reverse-deps (mostly just used for contextualizing what uses it)
-    pub reverse_deps: SortedSet<PackageIdx>,
-    /// Whether this package is a workspace member (can have dev-deps)
-    pub is_workspace_member: bool,
-    /// Whether this package is third-party (from crates.io)
-    pub is_third_party: bool,
-    /// Whether this package is a root in the "normal" build graph
-    pub is_root: bool,
-    /// Whether this package only shows up in dev (test/bench) builds
-    pub is_dev_only: bool,
-}
-
-/// The dependency graph in a form we can use more easily.
-#[derive(Debug, Clone)]
-pub struct DepGraph<'a> {
-    pub nodes: Vec<PackageNode<'a>>,
-    pub interner_by_pkgid: SortedMap<&'a PackageId, PackageIdx>,
-    pub topo_index: Vec<PackageIdx>,
 }
 
 /// Results and notes from running vet on a particular package.
@@ -396,638 +358,382 @@ pub enum SearchMode {
     RegenerateExemptions,
 }
 
-impl<'a> DepGraph<'a> {
-    pub fn new(
-        metadata: &'a Metadata,
-        filter_graph: Option<&Vec<GraphFilter>>,
-        policy: Option<&Policy>,
-    ) -> Self {
-        let default_policy = Policy::default();
-        let policy = policy.unwrap_or(&default_policy);
-        let package_list = &*metadata.packages;
-        let resolve_list = &*metadata
-            .resolve
-            .as_ref()
-            .expect("cargo metadata did not yield resolve!")
-            .nodes;
-        let package_index_by_pkgid = package_list
-            .iter()
-            .enumerate()
-            .map(|(idx, pkg)| (&pkg.id, idx))
-            .collect::<SortedMap<_, _>>();
-        let resolve_index_by_pkgid = resolve_list
-            .iter()
-            .enumerate()
-            .map(|(idx, pkg)| (&pkg.id, idx))
-            .collect();
-
-        // Do a first-pass where we populate skeletons of the primary nodes
-        // and setup the interners, which will only ever refer to these nodes
-        let mut interner_by_pkgid = SortedMap::<&PackageId, PackageIdx>::new();
-        let mut nodes = vec![];
-
-        // Stub out the initial state of all the nodes
-        for resolve_node in resolve_list {
-            let package = &package_list[package_index_by_pkgid[&resolve_node.id]];
-            nodes.push(PackageNode {
-                package_id: &resolve_node.id,
-                name: &package.name,
-                version: package.vet_version(),
-                is_third_party: package.is_third_party(policy),
-                // These will get (re)computed later
-                normal_deps: vec![],
-                build_deps: vec![],
-                dev_deps: vec![],
-                normal_and_build_deps: vec![],
-                all_deps: vec![],
-                reverse_deps: SortedSet::new(),
-                is_workspace_member: false,
-                is_root: false,
-                is_dev_only: true,
-            });
-        }
-
-        // Sort the nodes by package name and version to make the graph as
-        // stable as possible.  We avoid sorting by the package_id if possible,
-        // as for some packages it may not be stable (e.g. file:///), and the
-        // package_id format can also vary between cargo versions.
-        nodes.sort_by(|a, b| {
-            (a.name, &a.version, &a.package_id).cmp(&(b.name, &b.version, &b.package_id))
-        });
-
-        // Populate the interners based on the new ordering
-        for (idx, node) in nodes.iter_mut().enumerate() {
-            assert!(interner_by_pkgid.insert(node.package_id, idx).is_none());
-        }
-
-        // Do topological sort: just recursively visit all of a node's children, and only add it
-        // to the list *after* visiting the children. In this way we have trivially already added
-        // all of the dependencies of a node to the list by the time we add itself to the list.
-        let mut topo_index = vec![];
-        {
-            let mut visited = FastMap::new();
-            // All of the roots can be found in the workspace_members.
-            // First we visit all the workspace members while ignoring dev-deps,
-            // this should get us an analysis of the "normal" build graph, which
-            // we should compute roots from. Then we will do a second pass on
-            // the dev-deps. If we don't do it this way, then dev-dep cycles can
-            // confuse us about which nodes are roots or not (potentially resulting
-            // in no roots at all!
-            for pkgid in &metadata.workspace_members {
-                let node_idx = interner_by_pkgid[pkgid];
-                nodes[node_idx].is_workspace_member = true;
-                visit_node(
-                    &mut nodes,
-                    &mut topo_index,
-                    &mut visited,
-                    &interner_by_pkgid,
-                    &resolve_index_by_pkgid,
-                    resolve_list,
-                    node_idx,
-                );
-            }
-
-            // Anything we visited in the first pass isn't dev-only
-            for (&node_idx, ()) in &visited {
-                nodes[node_idx].is_dev_only = false;
-            }
-
-            // Now that we've visited the normal build graph, mark the nodes that are roots
-            for pkgid in &metadata.workspace_members {
-                let node = &mut nodes[interner_by_pkgid[pkgid]];
-                node.is_root = node.reverse_deps.is_empty();
-            }
-
-            // And finally visit workspace-members' dev-deps, safe in the knowledge that
-            // we know what all the roots are now.
-            for pkgid in &metadata.workspace_members {
-                let node_idx = interner_by_pkgid[pkgid];
-                let resolve_node = &resolve_list[resolve_index_by_pkgid[pkgid]];
-                let dev_deps = deps(
-                    resolve_node,
-                    &[DependencyKind::Development],
-                    &interner_by_pkgid,
-                );
-
-                // Now visit all the dev deps
-                for &child in &dev_deps {
-                    visit_node(
-                        &mut nodes,
-                        &mut topo_index,
-                        &mut visited,
-                        &interner_by_pkgid,
-                        &resolve_index_by_pkgid,
-                        resolve_list,
-                        child,
-                    );
-                    // Note that these edges do not change whether something is a "root"
-                    nodes[child].reverse_deps.insert(node_idx);
-                }
-
-                let node = &mut nodes[node_idx];
-                node.dev_deps = dev_deps;
-            }
-            fn visit_node<'a>(
-                nodes: &mut Vec<PackageNode<'a>>,
-                topo_index: &mut Vec<PackageIdx>,
-                visited: &mut FastMap<PackageIdx, ()>,
-                interner_by_pkgid: &SortedMap<&'a PackageId, PackageIdx>,
-                resolve_index_by_pkgid: &SortedMap<&'a PackageId, usize>,
-                resolve_list: &'a [cargo_metadata::Node],
-                normal_idx: PackageIdx,
-            ) {
-                // Don't revisit a node we've already seen
-                let query = visited.entry(normal_idx);
-                if matches!(query, std::collections::hash_map::Entry::Vacant(..)) {
-                    query.or_insert(());
-                    let resolve_node =
-                        &resolve_list[resolve_index_by_pkgid[nodes[normal_idx].package_id]];
-
-                    // Compute the different kinds of dependencies
-                    let all_deps = resolve_node
-                        .dependencies
-                        .iter()
-                        .map(|pkgid| interner_by_pkgid[pkgid])
-                        .collect::<Vec<_>>();
-                    let build_deps =
-                        deps(resolve_node, &[DependencyKind::Build], interner_by_pkgid);
-                    let normal_deps =
-                        deps(resolve_node, &[DependencyKind::Normal], interner_by_pkgid);
-                    let normal_and_build_deps = deps(
-                        resolve_node,
-                        &[DependencyKind::Normal, DependencyKind::Build],
-                        interner_by_pkgid,
-                    );
-
-                    // Now visit all the normal and build deps
-                    for &child in &normal_and_build_deps {
-                        visit_node(
-                            nodes,
-                            topo_index,
-                            visited,
-                            interner_by_pkgid,
-                            resolve_index_by_pkgid,
-                            resolve_list,
-                            child,
-                        );
-                        nodes[child].reverse_deps.insert(normal_idx);
-                    }
-
-                    // Now visit this node itself
-                    topo_index.push(normal_idx);
-
-                    // Now commit all the deps
-                    let cur_node = &mut nodes[normal_idx];
-                    cur_node.build_deps = build_deps;
-                    cur_node.normal_deps = normal_deps;
-                    cur_node.normal_and_build_deps = normal_and_build_deps;
-                    cur_node.all_deps = all_deps;
-
-                    // dev-deps will be handled in a second pass
-                }
-            }
-            fn deps(
-                resolve_node: &Node,
-                kinds: &[DependencyKind],
-                interner_by_pkgid: &SortedMap<&PackageId, PackageIdx>,
-            ) -> Vec<PackageIdx> {
-                // Note that dep_kinds has target cfg info. If we want to handle targets
-                // we should gather those up with filter/fold instead of just 'any'.
-                // TODO: map normal-deps that whose package has a "proc-macro" target to be build-deps
-                resolve_node
-                    .deps
-                    .iter()
-                    .filter(|dep| {
-                        dep.dep_kinds
-                            .iter()
-                            .any(|dep_kind| kinds.contains(&dep_kind.kind))
-                    })
-                    .map(|dep| interner_by_pkgid[&dep.pkg])
-                    .collect()
-            }
-        }
-
-        let result = Self {
-            interner_by_pkgid,
-            nodes,
-            topo_index,
-        };
-
-        // Now apply filters, if any
-        if let Some(filters) = filter_graph {
-            result.filter(filters)
-        } else {
-            result
-        }
-    }
-
-    pub fn filter(self, filters: &[GraphFilter]) -> Self {
-        use GraphFilter::*;
-        use GraphFilterProperty::*;
-        use GraphFilterQuery::*;
-
-        fn matches_query(package: &PackageNode, query: &GraphFilterQuery) -> bool {
-            match query {
-                All(queries) => queries.iter().all(|q| matches_query(package, q)),
-                Any(queries) => queries.iter().any(|q| matches_query(package, q)),
-                Not(query) => !matches_query(package, query),
-                Prop(property) => matches_property(package, property),
-            }
-        }
-        fn matches_property(package: &PackageNode, property: &GraphFilterProperty) -> bool {
-            match property {
-                Name(val) => package.name == val,
-                Version(val) => &package.version == val,
-                IsRoot(val) => &package.is_root == val,
-                IsWorkspaceMember(val) => &package.is_workspace_member == val,
-                IsThirdParty(val) => &package.is_third_party == val,
-                IsDevOnly(val) => &package.is_dev_only == val,
-            }
-        }
-
-        let mut passed_filters = FastSet::new();
-        'nodes: for (idx, package) in self.nodes.iter().enumerate() {
-            for filter in filters {
-                match filter {
-                    Include(query) => {
-                        if !matches_query(package, query) {
-                            continue 'nodes;
-                        }
-                    }
-
-                    Exclude(query) => {
-                        if matches_query(package, query) {
-                            continue 'nodes;
-                        }
-                    }
-                }
-            }
-            // If we pass all the filters, then we get to be included
-            passed_filters.insert(idx);
-        }
-
-        let mut reachable = FastMap::new();
-        for (idx, package) in self.nodes.iter().enumerate() {
-            if package.is_workspace_member {
-                visit(&mut reachable, &self, &passed_filters, idx);
-            }
-            fn visit(
-                visited: &mut FastMap<PackageIdx, ()>,
-                graph: &DepGraph,
-                passed_filters: &FastSet<PackageIdx>,
-                node_idx: PackageIdx,
-            ) {
-                if !passed_filters.contains(&node_idx) {
-                    return;
-                }
-                let query = visited.entry(node_idx);
-                if matches!(query, std::collections::hash_map::Entry::Vacant(..)) {
-                    query.or_insert(());
-                    for &child in &graph.nodes[node_idx].all_deps {
-                        visit(visited, graph, passed_filters, child);
-                    }
-                }
-            }
-        }
-
-        let mut old_to_new = FastMap::new();
-        let mut nodes = Vec::new();
-        let mut interner_by_pkgid = SortedMap::new();
-        let mut topo_index = Vec::new();
-        for (old_idx, package) in self.nodes.iter().enumerate() {
-            if !reachable.contains_key(&old_idx) {
-                continue;
-            }
-            let new_idx = nodes.len();
-            old_to_new.insert(old_idx, new_idx);
-            nodes.push(PackageNode {
-                package_id: package.package_id,
-                name: package.name,
-                version: package.version.clone(),
-                normal_deps: vec![],
-                build_deps: vec![],
-                dev_deps: vec![],
-                normal_and_build_deps: vec![],
-                all_deps: vec![],
-                reverse_deps: SortedSet::new(),
-                is_workspace_member: package.is_workspace_member,
-                is_third_party: package.is_third_party,
-                is_root: package.is_root,
-                is_dev_only: package.is_dev_only,
-            });
-            interner_by_pkgid.insert(package.package_id, new_idx);
-        }
-        for old_idx in &self.topo_index {
-            if let Some(&new_idx) = old_to_new.get(old_idx) {
-                topo_index.push(new_idx);
-            }
-        }
-        for (old_idx, old_package) in self.nodes.iter().enumerate() {
-            if let Some(&new_idx) = old_to_new.get(&old_idx) {
-                let new_package = &mut nodes[new_idx];
-                for old_dep in &old_package.normal_deps {
-                    if let Some(&new_dep) = old_to_new.get(old_dep) {
-                        new_package.normal_deps.push(new_dep);
-                    }
-                }
-                for old_dep in &old_package.build_deps {
-                    if let Some(&new_dep) = old_to_new.get(old_dep) {
-                        new_package.build_deps.push(new_dep);
-                    }
-                }
-                for old_dep in &old_package.dev_deps {
-                    if let Some(&new_dep) = old_to_new.get(old_dep) {
-                        new_package.dev_deps.push(new_dep);
-                    }
-                }
-                for old_dep in &old_package.normal_and_build_deps {
-                    if let Some(&new_dep) = old_to_new.get(old_dep) {
-                        new_package.normal_and_build_deps.push(new_dep);
-                    }
-                }
-                for old_dep in &old_package.all_deps {
-                    if let Some(&new_dep) = old_to_new.get(old_dep) {
-                        new_package.all_deps.push(new_dep);
-                    }
-                }
-                for old_dep in &old_package.reverse_deps {
-                    if let Some(&new_dep) = old_to_new.get(old_dep) {
-                        new_package.reverse_deps.insert(new_dep);
-                    }
-                }
-            }
-        }
-
-        Self {
-            nodes,
-            interner_by_pkgid,
-            topo_index,
-        }
-    }
-
-    pub fn print_mermaid(
-        &self,
-        out: &Arc<dyn Out>,
-        sub_args: &DumpGraphArgs,
-    ) -> Result<(), std::io::Error> {
-        use crate::DumpGraphDepth::*;
-        let depth = sub_args.depth;
-
-        let mut visible_nodes = SortedSet::new();
-        let mut nodes_with_children = SortedSet::new();
-        let mut shown = SortedSet::new();
-
-        for (idx, package) in self.nodes.iter().enumerate() {
-            if (package.is_root && depth >= Roots)
-                || (package.is_workspace_member && depth >= Workspace)
-                || (!package.is_third_party && depth >= FirstParty)
-                || depth >= Full
-            {
-                visible_nodes.insert(idx);
-                nodes_with_children.insert(idx);
-
-                if depth >= FirstPartyAndDirects {
-                    for &dep in &package.all_deps {
-                        visible_nodes.insert(dep);
-                    }
-                }
-            }
-        }
-
-        writeln!(out, "graph LR");
-
-        writeln!(out, "    subgraph roots");
-        for &idx in &visible_nodes {
-            let package = &self.nodes[idx];
-            if package.is_root && shown.insert(idx) {
-                writeln!(
-                    out,
-                    "        node{idx}{{{}:{}}}",
-                    package.name, package.version
-                );
-            }
-        }
-        writeln!(out, "    end");
-
-        writeln!(out, "    subgraph workspace-members");
-        for &idx in &visible_nodes {
-            let package = &self.nodes[idx];
-            if package.is_workspace_member && shown.insert(idx) {
-                writeln!(
-                    out,
-                    "        node{idx}[/{}:{}/]",
-                    package.name, package.version
-                );
-            }
-        }
-        writeln!(out, "    end");
-
-        writeln!(out, "    subgraph first-party");
-        for &idx in &visible_nodes {
-            let package = &self.nodes[idx];
-            if !package.is_third_party && shown.insert(idx) {
-                writeln!(
-                    out,
-                    "        node{idx}[{}:{}]",
-                    package.name, package.version
-                );
-            }
-        }
-        writeln!(out, "    end");
-
-        writeln!(out, "    subgraph third-party");
-        for &idx in &visible_nodes {
-            let package = &self.nodes[idx];
-            if shown.insert(idx) {
-                writeln!(
-                    out,
-                    "        node{idx}({}:{})",
-                    package.name, package.version
-                );
-            }
-        }
-        writeln!(out, "    end");
-
-        for &idx in &nodes_with_children {
-            let package = &self.nodes[idx];
-            for &dep_idx in &package.all_deps {
-                if visible_nodes.contains(&dep_idx) {
-                    writeln!(out, "    node{idx} --> node{dep_idx}");
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
 pub fn resolve<'a>(
-    metadata: &'a Metadata,
-    filter_graph: Option<&Vec<GraphFilter>>,
+    package_graph: &'a PackageGraph,
+    resolver_version: CargoResolverVersion,
     store: &Store,
 ) -> ResolveReport<'a> {
     // A large part of our algorithm is unioning and intersecting criteria, so we map all
     // the criteria into indexed boolean sets (*whispers* an integer with lots of bits).
-    let graph = DepGraph::new(metadata, filter_graph, Some(&store.config.policy));
-    // trace!("built DepGraph: {:#?}", graph);
-    trace!("built DepGraph!");
-
     let criteria_mapper = CriteriaMapper::new(&store.audits.criteria);
     trace!("built CriteriaMapper!");
 
-    let requirements = resolve_requirements(&graph, &store.config.policy, &criteria_mapper);
+    // FIXME: The CargoResolverVersion should be based on the edition & version
+    // in Cargo.toml!
+    let requirements = resolve_requirements(
+        package_graph,
+        &store.config.policy,
+        &criteria_mapper,
+        resolver_version,
+    );
 
-    let (results, conclusion) = resolve_audits(&graph, store, &criteria_mapper, &requirements);
+    let (results, conclusion) =
+        resolve_audits(package_graph, store, &criteria_mapper, &requirements);
 
     ResolveReport {
-        graph,
         criteria_mapper,
         results,
         conclusion,
     }
 }
 
-fn resolve_requirements(
-    graph: &DepGraph<'_>,
+/// Check if a given PackageLink is enabled for a given build & dependency kind.
+fn is_link_enabled(
+    feature_set: &FeatureSet<'_>,
+    link: &PackageLink<'_>,
+    kind: DependencyKind,
+    platform_spec: &PlatformSpec,
+) -> bool {
+    let req_status = link.req_for_kind(kind).status();
+
+    // Check if we have a feature for this dependency enabled. If we do, we'll
+    // also include optional dependencies.
+    let enabled = if feature_set
+        .contains((
+            link.from().id(),
+            FeatureLabel::OptionalDependency(link.dep_name()),
+        ))
+        .unwrap_or(false)
+    {
+        req_status.enabled_on(platform_spec)
+    } else {
+        req_status.required_on(platform_spec)
+    };
+
+    // NOTE: We bias towards assuming an edge is enabled if we don't have
+    // information about the target features for a platform.
+    enabled != EnabledTernary::Disabled
+}
+
+fn resolve_requirements_for_build<'g>(
     policy: &Policy,
     criteria_mapper: &CriteriaMapper,
-) -> Vec<CriteriaSet> {
-    let _resolve_requirements = trace_span!("resolve_requirements").entered();
+    initials: FeatureSet<'g>,
+    platform: &PlatformSpec,
+    resolver_version: CargoResolverVersion,
+    dev_pass: bool,
+    out_requirements: &mut FastMap<&'g PackageId, CriteriaSet>,
+) {
+    let _resolve_requirements_for_build = debug_span!(
+        "resolve_requirements_for_build",
+        initials = ?initials,
+        platform = ?platform,
+        dev_pass
+    )
+    .entered();
 
-    let mut requirements = vec![criteria_mapper.no_criteria(); graph.nodes.len()];
+    // Use guppy's "cargo set" algorithm to resolve the final feature sets for
+    // the target & host platforms for this build. This will be used when
+    // evaluating edges.
+    let cargo_set = initials
+        .into_cargo_set(
+            CargoOptions::new()
+                .set_platform(platform.clone())
+                .set_include_dev(dev_pass)
+                .set_resolver(resolver_version),
+        )
+        .expect("FeatureSet::into_cargo_set cannot fail unless an invalid PackageId is excluded");
 
-    // For any packages which have dev-dependencies, apply policy-specified
-    // dependency-criteria or dev-criteria to those dependencies.
-    for package in &graph.nodes {
-        if package.dev_deps.is_empty() {
-            continue;
-        }
+    let initial_criteria = if dev_pass {
+        criteria_mapper.criteria_from_list([format::DEFAULT_POLICY_DEV_CRITERIA])
+    } else {
+        criteria_mapper.criteria_from_list([format::DEFAULT_POLICY_CRITERIA])
+    };
 
-        let policy = policy.get(package.name, &package.version);
-        let dev_criteria = if let Some(c) = policy.and_then(|p| p.dev_criteria.as_ref()) {
-            criteria_mapper.criteria_from_list(c)
-        } else {
-            criteria_mapper.criteria_from_list([format::DEFAULT_POLICY_DEV_CRITERIA])
-        };
-
-        for &depidx in &package.dev_deps {
-            let dep_package = &graph.nodes[depidx];
-            let dependency_criteria = policy
-                .and_then(|policy| policy.dependency_criteria.get(dep_package.name))
-                .map(|criteria| criteria_mapper.criteria_from_list(criteria));
-            requirements[depidx]
-                .unioned_with(dependency_criteria.as_ref().unwrap_or(&dev_criteria));
-        }
+    // Use our initials set to populate the first set of todo items.
+    struct Todo<'g> {
+        build_platform: BuildPlatform,
+        package: PackageMetadata<'g>,
+        criteria: CriteriaSet,
     }
 
-    // Walk the topo graph in reverse, so that we visit each package before any
-    // dependencies.
-    for &pkgidx in graph.topo_index.iter().rev() {
-        let package = &graph.nodes[pkgidx];
-        let policy = policy.get(package.name, &package.version);
+    // Pending TODO item stack. This approach means we effectively do a DFS.
+    // Order of evaluating todos should not matter.
+    let mut todos: Vec<_> = cargo_set
+        .initials()
+        .to_package_set()
+        .packages(DependencyDirection::Forward)
+        .map(|package| Todo {
+            build_platform: BuildPlatform::Target,
+            package,
+            criteria: initial_criteria.clone(),
+        })
+        .collect();
 
-        if let Some(c) = policy.and_then(|p| p.criteria.as_ref()) {
-            // If we specify a policy on ourselves, override any requirements we've
-            // had placed on us by reverse-dependencies.
-            requirements[pkgidx] = criteria_mapper.criteria_from_list(c);
-        } else if package.is_root {
-            // If this is a root crate, it will require at least
-            // `DEFAULT_POLICY_CRITERIA` by default, unless overridden.
-            requirements[pkgidx].unioned_with(
-                &criteria_mapper.criteria_from_list([format::DEFAULT_POLICY_CRITERIA]),
+    let mut target_seen = FastMap::<&PackageId, CriteriaSet>::new();
+    let mut host_seen = FastMap::<&PackageId, CriteriaSet>::new();
+
+    while let Some(todo) = todos.pop() {
+        let _resolve_requirements_todo = trace_span!(
+            "resolve_requirements_todo",
+            platform = ?todo.build_platform,
+            package = %todo.package.id(),
+            criteria = ?todo.criteria
+        );
+
+        let self_policy = todo.package.policy_entry(policy);
+
+        let build_platform = if todo.package.is_proc_macro() {
+            BuildPlatform::Host
+        } else {
+            todo.build_platform
+        };
+
+        let explicit_criteria = self_policy
+            .and_then(|p| p.criteria.as_ref())
+            .map(|c| criteria_mapper.criteria_from_list(c))
+            .unwrap_or_else(|| todo.criteria.clone());
+        let explicit_dev_criteria = self_policy
+            .and_then(|p| p.dev_criteria.as_ref())
+            .map(|c| criteria_mapper.criteria_from_list(c))
+            .unwrap_or_else(|| {
+                // If `policy.criteria` was specified, but `policy.dev-criteria`
+                // was not, cap the required criteria during the dev pass to at
+                // most `policy.criteria` (as the dev pass must not expand
+                // required criteria beyond `policy.criteria`).
+                let mut criteria = todo.criteria.clone();
+                criteria.intersected_with(&explicit_criteria);
+                criteria
+            });
+
+        let self_criteria = if dev_pass {
+            explicit_dev_criteria
+        } else {
+            explicit_criteria
+        };
+
+        // If we've already seen this package, on this platform, and there are
+        // no new criteria, we've entered a loop. Break it.
+        let seen = match build_platform {
+            BuildPlatform::Target => &mut target_seen,
+            BuildPlatform::Host => &mut host_seen,
+        };
+        match seen.entry(todo.package.id()) {
+            hash_map::Entry::Occupied(occupied_entry)
+                if occupied_entry.get().contains(&self_criteria) =>
+            {
+                continue;
+            }
+            entry => entry
+                .or_insert_with(|| criteria_mapper.no_criteria())
+                .unioned_with(&self_criteria),
+        }
+
+        trace!(
+            "applying criteria {:?} for {} ({build_platform:?})",
+            criteria_mapper
+                .criteria_names(&self_criteria)
+                .collect::<Vec<_>>()
+                .join(", "),
+            todo.package.id()
+        );
+
+        // We're making progress, record the new required criteria for the
+        // package in `out_requirements` if the crate is third-party.
+        // First party crates do not contribute to audit requirements.
+        if todo.package.is_third_party(policy) {
+            out_requirements
+                .entry(todo.package.id())
+                .or_insert_with(|| criteria_mapper.no_criteria())
+                .unioned_with(&self_criteria);
+        }
+
+        let feature_set = cargo_set.platform_features(build_platform);
+
+        // Check direct dependencies declared by this node, and add todo items
+        // to process them with.
+        for link in todo.package.direct_links() {
+            let package = link.to();
+            let criteria = self_policy
+                .and_then(|policy| policy.dependency_criteria.get(package.name()))
+                .map(|criteria| criteria_mapper.criteria_from_list(criteria))
+                .unwrap_or_else(|| self_criteria.clone());
+
+            // We may need to add multiple todos for this dependency edge, if
+            // it's both a normal and build dependency of the crate (as each may
+            // unify features differently).
+            let has_normal = is_link_enabled(feature_set, &link, DependencyKind::Normal, platform);
+            // Dev edges are only checked in the dev pass.
+            let has_dev = dev_pass
+                && is_link_enabled(feature_set, &link, DependencyKind::Development, platform);
+            // Cargo only follows build dependencies if a build script is
+            // present, mimic that behaviour here.
+            let has_build = todo.package.has_build_script()
+                && is_link_enabled(feature_set, &link, DependencyKind::Build, platform);
+
+            trace!(
+                "link to {} (criteria={criteria:?}) normal={has_normal} dev={has_dev} build={has_build}",
+                package.id()
             );
-        }
-        let normal_criteria = requirements[pkgidx].clone();
 
-        // For each dependency, elaborate the dependency criteria from the configured policy and add it to the dependency requirements.
-        for &depidx in &package.normal_and_build_deps {
-            let dep_package = &graph.nodes[depidx];
-            let dependency_criteria = policy
-                .and_then(|policy| policy.dependency_criteria.get(dep_package.name))
-                .map(|criteria| criteria_mapper.criteria_from_list(criteria));
-            requirements[depidx]
-                .unioned_with(dependency_criteria.as_ref().unwrap_or(&normal_criteria));
+            if has_normal || has_dev {
+                todos.push(Todo {
+                    build_platform,
+                    package,
+                    criteria: criteria.clone(),
+                })
+            }
+            if has_build {
+                todos.push(Todo {
+                    build_platform: BuildPlatform::Host,
+                    package,
+                    criteria,
+                })
+            }
         }
+    }
+}
+
+fn resolve_requirements<'g>(
+    package_graph: &'g PackageGraph,
+    policy: &Policy,
+    criteria_mapper: &CriteriaMapper,
+    resolver_version: CargoResolverVersion,
+) -> FastMap<&'g PackageId, CriteriaSet> {
+    let _resolve_requirements = trace_span!("resolve_requirements").entered();
+
+    // FIXME: Allow the user to customize a subset of platforms to be interested
+    // in, and check each independently.
+    let platform_spec = PlatformSpec::Any;
+
+    let mut requirements = FastMap::<&'g PackageId, CriteriaSet>::new();
+
+    let workspace_set = package_graph.resolve_workspace();
+
+    // First-pass: Simulate a build for the entire workspace at once, with
+    // dev-dependencies enabled. Dependencies built this way will use dev
+    // criteria, respecting config options.
+    debug!("simulating --workspace dev build (dev_pass)");
+    resolve_requirements_for_build(
+        policy,
+        criteria_mapper,
+        workspace_set.to_feature_set(StandardFeatures::All),
+        &platform_spec,
+        resolver_version,
+        /* dev_pass */ true,
+        &mut requirements,
+    );
+
+    // Second-pass: Simulate a build of each root package independently, with
+    // dev-dependencies disabled. Dependencies built this way will use standard
+    // criteria, respecting config options.
+    for root in workspace_set.root_packages(DependencyDirection::Forward) {
+        debug!("simulating target build of root package: {}", root.id());
+        resolve_requirements_for_build(
+            policy,
+            criteria_mapper,
+            root.to_feature_set(StandardFeatures::All),
+            &platform_spec,
+            resolver_version,
+            /* dev_pass */ false,
+            &mut requirements,
+        );
     }
 
     requirements
 }
 
-fn resolve_audits(
-    graph: &DepGraph<'_>,
+fn resolve_audits<'g>(
+    package_graph: &'g PackageGraph,
     store: &Store,
     criteria_mapper: &CriteriaMapper,
-    requirements: &[CriteriaSet],
-) -> (Vec<Option<ResolveResult>>, Conclusion) {
+    requirements: &FastMap<&'g PackageId, CriteriaSet>,
+) -> (FastMap<&'g PackageId, ResolveResult>, Conclusion<'g>) {
     let _resolve_audits = trace_span!("resolve_audits").entered();
     let mut violations = Vec::new();
     let mut failures = Vec::new();
     let mut vetted_with_exemptions = Vec::new();
     let mut vetted_partially = Vec::new();
     let mut vetted_fully = Vec::new();
-    let results: Vec<_> = requirements
-        .iter()
-        .enumerate()
-        .map(|(pkgidx, required_criteria)| {
-            let package = &graph.nodes[pkgidx];
-            if !package.is_third_party {
-                return None; // first-party crates don't need audits
+
+    let mut results = FastMap::<&'g PackageId, ResolveResult>::new();
+    for package in package_graph.packages() {
+        // First-party crates don't need audits.
+        if !package.is_third_party(&store.config.policy) {
+            continue;
+        }
+
+        let audit_graph = match AuditGraph::build(store, criteria_mapper, package.name(), None) {
+            Ok(audit_graph) => audit_graph,
+            Err(violation) => {
+                violations.push((package, violation));
+                continue;
             }
+        };
 
-            let audit_graph = AuditGraph::build(store, criteria_mapper, package.name, None)
-                .map_err(|v| violations.push((pkgidx, v)))
-                .ok()?;
+        let no_criteria = criteria_mapper.no_criteria();
+        let required_criteria = requirements.get(package.id()).unwrap_or(&no_criteria);
 
-            // NOTE: We currently always compute all search results even if we
-            // only need those in `req_criteria` because some later passes using
-            // the resolver results might need that information. We might want
-            // to look into simplifying this in the future.
-            let search_results: Vec<_> = (0..criteria_mapper.len())
-                .map(|criteria_idx| {
-                    audit_graph.search(criteria_idx, &package.version, SearchMode::PreferExemptions)
-                })
-                .collect();
+        // NOTE: We currently always compute all search results even if we
+        // only need those in `req_criteria` because some later passes using
+        // the resolver results might need that information. We might want
+        // to look into simplifying this in the future.
+        let search_results: Vec<_> = (0..criteria_mapper.len())
+            .map(|criteria_idx| {
+                audit_graph.search(
+                    criteria_idx,
+                    &package.vet_version(),
+                    SearchMode::PreferExemptions,
+                )
+            })
+            .collect();
 
-            let mut needed_exemptions = false;
-            let mut directly_exempted = false;
-            let mut criteria_failures = criteria_mapper.no_criteria();
-            for criteria_idx in required_criteria.indices() {
-                match &search_results[criteria_idx] {
-                    Ok(path) => {
-                        needed_exemptions |= path
-                            .iter()
-                            .any(|o| matches!(o, DeltaEdgeOrigin::Exemption { .. }));
-                        // Ignore `Unpublished` entries when deciding if a crate
-                        // is directly exempted.
-                        directly_exempted |= path.iter().all(|o| {
-                            matches!(
-                                o,
-                                DeltaEdgeOrigin::Exemption { .. }
-                                    | DeltaEdgeOrigin::Unpublished { .. }
-                            )
-                        });
-                    }
-                    Err(_) => criteria_failures.set_criteria(criteria_idx),
+        let mut needed_exemptions = false;
+        let mut directly_exempted = false;
+        let mut criteria_failures = criteria_mapper.no_criteria();
+        for criteria_idx in required_criteria.indices() {
+            match &search_results[criteria_idx] {
+                Ok(path) => {
+                    needed_exemptions |= path
+                        .iter()
+                        .any(|o| matches!(o, DeltaEdgeOrigin::Exemption { .. }));
+                    // Ignore `Unpublished` entries when deciding if a crate
+                    // is directly exempted.
+                    directly_exempted |= path.iter().all(|o| {
+                        matches!(
+                            o,
+                            DeltaEdgeOrigin::Exemption { .. } | DeltaEdgeOrigin::Unpublished { .. }
+                        )
+                    });
                 }
+                Err(_) => criteria_failures.set_criteria(criteria_idx),
             }
+        }
 
-            if !criteria_failures.is_empty() {
-                failures.push((pkgidx, AuditFailure { criteria_failures }));
-            }
+        if !criteria_failures.is_empty() {
+            failures.push((package, AuditFailure { criteria_failures }));
+        }
 
-            // XXX: Callers using these fields in success should perhaps be
-            // changed to instead walk the results?
-            if !needed_exemptions {
-                vetted_fully.push(pkgidx);
-            } else if directly_exempted {
-                vetted_with_exemptions.push(pkgidx);
-            } else {
-                vetted_partially.push(pkgidx);
-            }
+        // XXX: Callers using these fields in success should perhaps be
+        // changed to instead walk the results?
+        if !needed_exemptions {
+            vetted_fully.push(package);
+        } else if directly_exempted {
+            vetted_with_exemptions.push(package);
+        } else {
+            vetted_partially.push(package);
+        }
 
-            Some(ResolveResult { search_results })
-        })
-        .collect();
+        results.insert(package.id(), ResolveResult { search_results });
+    }
+
+    fn package_sort_key<'g>(package: &PackageMetadata<'g>) -> (&'g str, VetVersion, &'g PackageId) {
+        (package.name(), package.vet_version(), package.id())
+    }
+    vetted_fully.sort_by_key(package_sort_key);
+    vetted_with_exemptions.sort_by_key(package_sort_key);
+    vetted_partially.sort_by_key(package_sort_key);
+    failures.sort_by_key(|(package, _)| package_sort_key(package));
 
     let conclusion = if !violations.is_empty() {
         Conclusion::FailForViolationConflict(FailForViolationConflict { violations })
@@ -1680,7 +1386,7 @@ impl ResolveReport<'_> {
         cfg: &Config,
         store: &Store,
         network: Option<&Network>,
-    ) -> Result<Option<Suggest>, SuggestError> {
+    ) -> Result<Option<Suggest<'_>>, SuggestError> {
         let _suggest_span = trace_span!("suggest").entered();
         let fail = if let Conclusion::FailForVet(fail) = &self.conclusion {
             fail
@@ -1730,28 +1436,28 @@ impl ResolveReport<'_> {
 
         let mut suggestions = tokio::runtime::Handle::current()
             .block_on(join_all(fail.failures.iter().map(
-                |(failure_idx, audit_failure)| async {
+                |(package, audit_failure)| async {
                     let _guard = IncProgressOnDrop(&suggest_progress, 1);
 
-                    let failure_idx = *failure_idx;
-                    let package = &self.graph.nodes[failure_idx];
-                    let result = self.results[failure_idx]
-                        .as_ref()
+                    let package_version = package.vet_version();
+
+                    let result = self
+                        .results
+                        .get(package.id())
                         .expect("failed package without ResolveResults?");
 
                     // Precompute some "notable" parents
-                    let notable_parents: Vec<_> = self.graph.nodes[failure_idx]
-                        .reverse_deps
-                        .iter()
-                        .map(|&parent| self.graph.nodes[parent].name.to_string())
+                    let notable_parents: Vec<_> = package
+                        .reverse_direct_links()
+                        .map(|link| link.from().name().to_owned())
                         .collect();
 
                     let Some((suggested_diff, extra_suggested_diff)) = suggest_delta(
-                        &cfg.metadata,
+                        &cfg.package_graph,
                         network,
                         &cache,
-                        package.name,
-                        &package.version,
+                        package.name(),
+                        &package_version,
                         audit_failure
                             .criteria_failures
                             .indices()
@@ -1768,7 +1474,7 @@ impl ResolveReport<'_> {
                     // Attempt to look up the publisher of the target version
                     // for the suggested diff, and also record whether the given
                     // package has a sole publisher.
-                    let crates_io_info = cache.crates_io_info(network, package.name).await.ok();
+                    let crates_io_info = cache.crates_io_info(network, package.name()).await.ok();
                     let publisher_source = match (suggested_diff.to.as_semver(), &crates_io_info) {
                         (Some(semver), Some(metadata)) => metadata
                             .versions
@@ -1798,7 +1504,7 @@ impl ResolveReport<'_> {
                         {
                             exact_version = true;
                             publisher_source
-                        } else if !store.audits.trusted.contains_key(package.name) {
+                        } else if !store.audits.trusted.contains_key(package.name()) {
                             crates_io_info.as_ref().and_then(|metadata| {
                                 metadata
                                     .versions
@@ -1847,7 +1553,7 @@ impl ResolveReport<'_> {
                             let audit_graph = AuditGraph::build(
                                 &store,
                                 &self.criteria_mapper,
-                                package.name,
+                                package.name(),
                                 Some(audits),
                             )
                             .ok()?;
@@ -1858,7 +1564,7 @@ impl ResolveReport<'_> {
                             let target_version = extra_suggested_diff
                                 .as_ref()
                                 .and_then(|d| d.from.as_ref())
-                                .unwrap_or(&package.version);
+                                .unwrap_or(&package_version);
 
                             let failures: Vec<_> = audit_failure
                                 .criteria_failures
@@ -1875,10 +1581,10 @@ impl ResolveReport<'_> {
                                 .collect();
 
                             let (registry_suggested_diff, _) = suggest_delta(
-                                &cfg.metadata,
+                                &cfg.package_graph,
                                 network,
                                 &cache,
-                                package.name,
+                                package.name(),
                                 target_version,
                                 failures.iter(),
                                 &warnings,
@@ -1907,7 +1613,7 @@ impl ResolveReport<'_> {
                     extra_suggested_diff
                         .into_iter()
                         .map(|suggested_diff| SuggestItem {
-                            package: failure_idx,
+                            package: *package,
                             suggested_diff,
                             suggested_criteria: audit_failure.criteria_failures.clone(),
                             notable_parents: notable_parents.clone(),
@@ -1917,7 +1623,7 @@ impl ResolveReport<'_> {
                             registry_suggestion: vec![],
                         })
                         .chain([SuggestItem {
-                            package: failure_idx,
+                            package: *package,
                             suggested_diff,
                             suggested_criteria: audit_failure.criteria_failures.clone(),
                             notable_parents: notable_parents.clone(),
@@ -1938,7 +1644,7 @@ impl ResolveReport<'_> {
         suggestions.sort_by_key(|item| {
             (
                 item.suggested_diff.diffstat.count(),
-                self.graph.nodes[item.package].name,
+                item.package.name(),
                 item.suggested_diff.to.clone(),
             )
         });
@@ -1947,9 +1653,7 @@ impl ResolveReport<'_> {
         // versions of the same crate requiring the same new audit, deduplicate
         // them in the output to avoid clutter.
         suggestions.dedup_by(|a, b| {
-            if self.graph.nodes[a.package].name == self.graph.nodes[b.package].name
-                && a.suggested_diff == b.suggested_diff
-            {
+            if a.package.name() == b.package.name() && a.suggested_diff == b.suggested_diff {
                 // Per the `dedup_by` documentation, if true is returned, `a`
                 // will be removed. Preserve its notable parents.
                 b.notable_parents.extend_from_slice(&a.notable_parents);
@@ -2036,14 +1740,14 @@ impl ResolveReport<'_> {
 
         // Enumerate over the recorded failures, adding any criteria for this
         // delta which would connect that package version into the audit graph.
-        for (failure_idx, audit_failure) in &fail.failures {
-            let package = &self.graph.nodes[*failure_idx];
-            if package.name != package_name {
+        for (package, audit_failure) in &fail.failures {
+            if package.name() != package_name {
                 continue;
             }
 
-            let result = &self.results[*failure_idx]
-                .as_ref()
+            let result = self
+                .results
+                .get(package.id())
                 .expect("failure without ResolveResults?");
             for criteria_idx in audit_failure.criteria_failures.indices() {
                 let search_result = &result.search_results[criteria_idx];
@@ -2104,12 +1808,9 @@ impl ResolveReport<'_> {
         let result = JsonReport {
             conclusion: match &self.conclusion {
                 Conclusion::Success(success) => {
-                    let json_package = |pkgidx: &PackageIdx| {
-                        let package = &self.graph.nodes[*pkgidx];
-                        JsonPackage {
-                            name: package.name.to_owned(),
-                            version: package.version.clone(),
-                        }
+                    let json_package = |package: &PackageMetadata<'_>| JsonPackage {
+                        name: package.name().to_owned(),
+                        version: package.vet_version(),
                     };
                     JsonReportConclusion::Success(JsonReportSuccess {
                         vetted_fully: success.vetted_fully.iter().map(json_package).collect(),
@@ -2131,9 +1832,9 @@ impl ResolveReport<'_> {
                             violations: fail
                                 .violations
                                 .iter()
-                                .map(|(pkgidx, violations)| {
-                                    let package = &self.graph.nodes[*pkgidx];
-                                    let key = format!("{}:{}", package.name, package.version);
+                                .map(|(package, violations)| {
+                                    let key =
+                                        format!("{}:{}", package.name(), package.vet_version());
                                     (key, violations.clone())
                                 })
                                 .collect(),
@@ -2142,34 +1843,28 @@ impl ResolveReport<'_> {
                 }
                 Conclusion::FailForVet(fail) => {
                     // FIXME: How to report confidence for suggested criteria?
-                    let json_suggest_item = |item: &SuggestItem| {
-                        let package = &self.graph.nodes[item.package];
-                        JsonSuggestItem {
-                            name: package.name.to_owned(),
-                            notable_parents: FormatShortList::string(item.notable_parents.clone()),
-                            suggested_criteria: self
-                                .criteria_mapper
-                                .criteria_names(&item.suggested_criteria)
-                                .map(|s| s.to_owned())
-                                .collect(),
-                            suggested_diff: item.suggested_diff.clone(),
-                        }
+                    let json_suggest_item = |item: &SuggestItem| JsonSuggestItem {
+                        name: item.package.name().to_owned(),
+                        notable_parents: FormatShortList::string(item.notable_parents.clone()),
+                        suggested_criteria: self
+                            .criteria_mapper
+                            .criteria_names(&item.suggested_criteria)
+                            .map(|s| s.to_owned())
+                            .collect(),
+                        suggested_diff: item.suggested_diff.clone(),
                     };
                     JsonReportConclusion::FailForVet(JsonReportFailForVet {
                         failures: fail
                             .failures
                             .iter()
-                            .map(|(pkgidx, audit_fail)| {
-                                let package = &self.graph.nodes[*pkgidx];
-                                JsonVetFailure {
-                                    name: package.name.to_owned(),
-                                    version: package.version.clone(),
-                                    missing_criteria: self
-                                        .criteria_mapper
-                                        .criteria_names(&audit_fail.criteria_failures)
-                                        .map(|s| s.to_owned())
-                                        .collect(),
-                                }
+                            .map(|(package, audit_fail)| JsonVetFailure {
+                                name: package.name().to_owned(),
+                                version: package.vet_version(),
+                                missing_criteria: self
+                                    .criteria_mapper
+                                    .criteria_names(&audit_fail.criteria_failures)
+                                    .map(|s| s.to_owned())
+                                    .collect(),
                             })
                             .collect(),
                         suggest: suggest.as_ref().map(|suggest| JsonSuggest {
@@ -2201,7 +1896,7 @@ impl ResolveReport<'_> {
     }
 }
 
-impl Success {
+impl Success<'_> {
     pub fn print_human(
         &self,
         out: &Arc<dyn Out>,
@@ -2254,11 +1949,11 @@ impl Success {
     }
 }
 
-impl Suggest {
+impl Suggest<'_> {
     pub fn print_human(
         &self,
         out: &Arc<dyn Out>,
-        report: &ResolveReport<'_>,
+        _report: &ResolveReport<'_>,
     ) -> Result<(), std::io::Error> {
         for (criteria, suggestions) in &self.suggestions_by_criteria {
             writeln!(out, "recommended audits for {criteria}:");
@@ -2266,15 +1961,17 @@ impl Suggest {
             let mut strings = suggestions
                 .iter()
                 .map(|item| {
-                    let package = &report.graph.nodes[item.package];
                     let cmd = match &item.suggested_diff.from {
                         Some(from) => format!(
                             "cargo vet diff {} {} {}",
-                            package.name, from, item.suggested_diff.to
+                            item.package.name(),
+                            from,
+                            item.suggested_diff.to
                         ),
                         None => format!(
                             "cargo vet inspect {} {}",
-                            package.name, item.suggested_diff.to
+                            item.package.name(),
+                            item.suggested_diff.to
                         ),
                     };
                     let publisher = item
@@ -2317,8 +2014,6 @@ impl Suggest {
                     .apply_to(format_args!("    {h0:max0$}  {h1:max1$}  {h2:max2$}  {h3}"))
             );
             for (s0, s1, s2, s3, item) in strings {
-                let package = &report.graph.nodes[item.package];
-
                 write!(
                     out,
                     "{}",
@@ -2366,7 +2061,7 @@ impl Suggest {
                             "NOTE: {trusted_by} {trust} {publisher}{caveat} - consider",
                         )),
                         if item.is_sole_publisher {
-                            let this_cmd = format!("cargo vet trust {}", package.name);
+                            let this_cmd = format!("cargo vet trust {}", item.package.name());
                             let all_cmd =
                                 format!("cargo vet trust --all {}", publisher.as_identifier());
                             format!(
@@ -2378,7 +2073,7 @@ impl Suggest {
                         } else {
                             let cmd = format!(
                                 "cargo vet trust {} {}",
-                                package.name,
+                                item.package.name(),
                                 publisher.as_identifier()
                             );
                             dim.clone().cyan().apply_to(cmd).to_string()
@@ -2410,7 +2105,7 @@ impl Suggest {
     }
 }
 
-impl FailForVet {
+impl FailForVet<'_> {
     fn print_human(
         &self,
         out: &Arc<dyn Out>,
@@ -2421,20 +2116,20 @@ impl FailForVet {
         writeln!(out, "Vetting Failed!");
         writeln!(out);
         writeln!(out, "{} unvetted dependencies:", self.failures.len());
-        let mut failures = self
-            .failures
-            .iter()
-            .map(|(failed_idx, failure)| (&report.graph.nodes[*failed_idx], failure))
-            .collect::<Vec<_>>();
-        failures.sort_by_key(|(failed, _)| &failed.version);
-        failures.sort_by_key(|(failed, _)| failed.name);
+        let mut failures = self.failures.clone();
+        failures.sort_by_key(|(failed, _)| failed.vet_version());
+        failures.sort_by_key(|(failed, _)| failed.name());
         for (failed_package, failed_audit) in failures {
             let criteria = report
                 .criteria_mapper
                 .criteria_names(&failed_audit.criteria_failures)
                 .collect::<Vec<_>>();
 
-            let label = format!("  {}:{}", failed_package.name, failed_package.version);
+            let label = format!(
+                "  {}:{}",
+                failed_package.name(),
+                failed_package.vet_version()
+            );
             writeln!(out, "{label} missing {criteria:?}");
         }
 
@@ -2448,18 +2143,17 @@ impl FailForVet {
     }
 }
 
-impl FailForViolationConflict {
+impl FailForViolationConflict<'_> {
     fn print_human(
         &self,
         out: &Arc<dyn Out>,
-        report: &ResolveReport<'_>,
+        _report: &ResolveReport<'_>,
         _cfg: &Config,
     ) -> Result<(), std::io::Error> {
         writeln!(out, "Violations Found!");
 
-        for (pkgidx, violations) in &self.violations {
-            let package = &report.graph.nodes[*pkgidx];
-            writeln!(out, "  {}:{}", package.name, package.version);
+        for (package, violations) in &self.violations {
+            writeln!(out, "  {}:{}", package.name(), package.vet_version());
             for violation in violations {
                 match violation {
                     ViolationConflict::UnauditedConflict {
@@ -2542,7 +2236,7 @@ impl FailForViolationConflict {
 }
 
 async fn suggest_delta(
-    metadata: &cargo_metadata::Metadata,
+    package_graph: &guppy::graph::PackageGraph,
     network: Option<&Network>,
     cache: &Cache,
     package_name: PackageStr<'_>,
@@ -2686,7 +2380,7 @@ async fn suggest_delta(
 
     let do_fetch_and_diffstat = |delta| async move {
         match cache
-            .fetch_and_diffstat_package(metadata, network, package_name, &delta)
+            .fetch_and_diffstat_package(package_graph, network, package_name, &delta)
             .await
         {
             Ok(diffstat) => Some(DiffRecommendation {
@@ -2731,23 +2425,27 @@ async fn suggest_delta(
 /// set, as it does not have any audit requirements.
 ///
 /// [`SearchMode`] controls how edges are selected when searching for paths.
-#[tracing::instrument(skip(graph, criteria_mapper, requirements, store))]
+#[tracing::instrument(skip(package_graph, criteria_mapper, requirements, store))]
 fn resolve_package_required_entries(
-    graph: &DepGraph<'_>,
+    package_graph: &PackageGraph,
     criteria_mapper: &CriteriaMapper,
-    requirements: &[CriteriaSet],
+    requirements: &FastMap<&PackageId, CriteriaSet>,
     store: &Store,
     package_name: PackageStr<'_>,
     search_mode: SearchMode,
 ) -> Option<SortedMap<RequiredEntry, CriteriaSet>> {
-    assert_eq!(graph.nodes.len(), requirements.len());
-
     // Collect the list of third-party packages with the given name, along with their requirements.
-    let packages: Vec<_> = graph
-        .nodes
-        .iter()
-        .zip(requirements)
-        .filter(|(package, _)| package.name == package_name && package.is_third_party)
+    let no_criteria = criteria_mapper.no_criteria();
+    let packages: Vec<_> = package_graph
+        .resolve_package_name(package_name)
+        .packages(DependencyDirection::Forward)
+        .filter(|package| package.is_third_party(&store.config.policy))
+        .map(|package| {
+            (
+                package,
+                requirements.get(package.id()).unwrap_or(&no_criteria),
+            )
+        })
         .collect();
 
     // If there are no third-party packages with the name, we definitely don't need any entries.
@@ -2763,10 +2461,11 @@ fn resolve_package_required_entries(
 
     let mut required_entries = SortedMap::new();
     for &(package, reqs) in &packages {
+        let version = package.vet_version();
         // Do the minimal set of searches to validate that the required criteria
         // are matched.
         for criteria_idx in criteria_mapper.minimal_indices(reqs) {
-            let Ok(path) = audit_graph.search(criteria_idx, &package.version, search_mode) else {
+            let Ok(path) = audit_graph.search(criteria_idx, &version, search_mode) else {
                 // This package failed to vet, return `None`.
                 return None;
             };
@@ -2900,24 +2599,27 @@ pub(crate) fn get_store_updates(
 ) -> StoreUpdates {
     // Compute the set of required entries from the store for all packages in
     // the dependency graph.
-    let graph = DepGraph::new(
-        &cfg.metadata,
-        cfg.cli.filter_graph.as_ref(),
-        Some(&store.config.policy),
-    );
     let criteria_mapper = CriteriaMapper::new(&store.audits.criteria);
-    let requirements = resolve_requirements(&graph, &store.config.policy, &criteria_mapper);
+
+    // FIXME: The CargoResolverVersion should be based on the edition & version
+    // in Cargo.toml!
+    let requirements = resolve_requirements(
+        &cfg.package_graph,
+        &store.config.policy,
+        &criteria_mapper,
+        cfg.resolver_version,
+    );
 
     let mut required_entries = SortedMap::new();
-    for package in &graph.nodes {
-        required_entries.entry(package.name).or_insert_with(|| {
+    for package in cfg.package_graph.packages() {
+        required_entries.entry(package.name()).or_insert_with(|| {
             resolve_package_required_entries(
-                &graph,
+                &cfg.package_graph,
                 &criteria_mapper,
                 &requirements,
                 store,
-                package.name,
-                mode(package.name).search_mode,
+                package.name(),
+                mode(package.name()).search_mode,
             )
         });
     }

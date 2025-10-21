@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use std::{fs::File, io, panic, path::PathBuf};
 
-use cargo_metadata::{Metadata, Package};
 use clap::{CommandFactory, Parser};
 use console::Term;
 use errors::{
@@ -20,6 +19,8 @@ use errors::{
 };
 use format::{CriteriaName, CriteriaStr, PackageName, Policy, PolicyEntry, SortedSet, VetVersion};
 use futures_util::future::{join_all, try_join_all};
+use guppy::graph::cargo::CargoResolverVersion;
+use guppy::graph::{ExternalSource, PackageGraph, PackageMetadata};
 use indicatif::ProgressDrawTarget;
 use lazy_static::lazy_static;
 use miette::{miette, Context, Diagnostic, IntoDiagnostic};
@@ -67,8 +68,10 @@ mod tests;
 pub struct Config {
     /// Cargo.toml `metadata.vet`
     pub metacfg: MetaConfig,
-    /// `cargo metadata`
-    pub metadata: Metadata,
+    /// Guppy package graph, derived from cargo metadata.
+    pub package_graph: PackageGraph,
+    /// Computed cargo package resolver version.
+    pub resolver_version: CargoResolverVersion,
     /// Freestanding configuration values
     _rest: PartialConfig,
 }
@@ -108,7 +111,7 @@ pub trait PackageExt {
     fn vet_version(&self) -> VetVersion;
 }
 
-impl PackageExt for Package {
+impl PackageExt for PackageMetadata<'_> {
     fn is_third_party(&self, policy: &Policy) -> bool {
         let forced_third_party = self
             .policy_entry(policy)
@@ -119,27 +122,23 @@ impl PackageExt for Package {
     }
 
     fn is_crates_io(&self) -> bool {
-        self.source
-            .as_ref()
-            .map(|s| s.is_crates_io())
-            .unwrap_or(false)
+        self.source().is_crates_io()
     }
 
     fn policy_entry<'a>(&self, policy: &'a Policy) -> Option<&'a PolicyEntry> {
-        policy.get(&self.name, &self.vet_version())
+        policy.get(self.name(), &self.vet_version())
     }
 
     fn git_rev(&self) -> Option<String> {
-        self.source.as_ref().and_then(|s| {
-            let git_source = s.repr.strip_prefix("git+")?;
-            let source_url = Url::parse(git_source).ok()?;
-            Some(source_url.fragment()?.to_owned())
-        })
+        match self.source().parse_external()? {
+            ExternalSource::Git { resolved, .. } => Some(resolved.to_owned()),
+            _ => None,
+        }
     }
 
     fn vet_version(&self) -> VetVersion {
         VetVersion {
-            semver: self.version.clone(),
+            semver: self.version().clone(),
             git_rev: self.git_rev(),
         }
     }
@@ -366,19 +365,10 @@ fn real_main() -> Result<(), miette::Report> {
     let cli = &partial_cfg.cli;
     let cargo_path = std::env::var_os(CARGO_ENV).expect("Cargo failed to set $CARGO, how?");
 
-    let mut cmd = cargo_metadata::MetadataCommand::new();
-    cmd.cargo_path(cargo_path);
+    let mut cmd = guppy::MetadataCommand::new();
+    cmd.cargo_path(&cargo_path);
     if let Some(manifest_path) = &cli.manifest_path {
         cmd.manifest_path(manifest_path);
-    }
-    if !cli.no_all_features {
-        cmd.features(cargo_metadata::CargoOpt::AllFeatures);
-    }
-    if cli.no_default_features {
-        cmd.features(cargo_metadata::CargoOpt::NoDefaultFeatures);
-    }
-    if !cli.features.is_empty() {
-        cmd.features(cargo_metadata::CargoOpt::SomeFeatures(cli.features.clone()));
     }
     // We never want cargo-vet to update the Cargo.lock.
     // For frozen runs we also don't want to touch the network.
@@ -395,18 +385,28 @@ fn real_main() -> Result<(), miette::Report> {
         other_options.push("--color=always".to_string());
     }
     other_options.extend(cli.cargo_arg.iter().cloned());
-    cmd.other_options(other_options);
+    cmd.other_options(other_options.clone());
 
     info!("Running: {:#?}", cmd.cargo_command());
 
     // ERRORS: immediate fatal diagnostic
-    let metadata = {
+    let package_graph = {
         let _spinner = indeterminate_spinner("Running", "`cargo metadata`");
-        cmd.exec().map_err(MetadataAcquireError::from)?
+        cmd.build_graph().map_err(MetadataAcquireError::from)?
     };
 
     // trace!("Got Metadata! {:#?}", metadata);
-    trace!("Got Metadata!");
+    trace!("Got Package Graph!");
+
+    //////////////////////////////////////////////////////
+    // Determine the Cargo resolver version
+    //////////////////////////////////////////////////////
+
+    // FIXME: Currently this is hard-coded to v2, and it appears the relevant
+    // information is not in the `cargo metadata` output. We'll need to parse
+    // `Cargo.toml` to read it out :'-(.
+    let resolver_version = CargoResolverVersion::V2;
+    // package_graph.workspace().root().join("Cargo.toml")
 
     //////////////////////////////////////////////////////
     // Parse out our own configuration
@@ -416,8 +416,9 @@ fn real_main() -> Result<(), miette::Report> {
         version: Some(1),
         store: Some(StoreInfo {
             path: Some(
-                metadata
-                    .workspace_root
+                package_graph
+                    .workspace()
+                    .root()
                     .join(storage::DEFAULT_STORE)
                     .into_std_path_buf(),
             ),
@@ -425,8 +426,9 @@ fn real_main() -> Result<(), miette::Report> {
     };
 
     // FIXME: what is `store.path` relative to here?
-    let workspace_metacfg = metadata
-        .workspace_metadata
+    let workspace_metacfg = package_graph
+        .workspace()
+        .metadata_table()
         .get(WORKSPACE_VET_CONFIG)
         .map(|cfg| {
             // ERRORS: immediate fatal diagnostic
@@ -437,16 +439,17 @@ fn real_main() -> Result<(), miette::Report> {
         .transpose()?;
 
     // FIXME: what is `store.path` relative to here?
-    let package_metacfg = metadata
-        .root_package()
-        .and_then(|r| r.metadata.get(PACKAGE_VET_CONFIG))
+    let package_metacfgs = package_graph
+        .resolve_workspace()
+        .root_packages(guppy::graph::DependencyDirection::Forward)
+        .filter_map(|pkg| pkg.metadata_table().get(PACKAGE_VET_CONFIG))
         .map(|cfg| {
             // ERRORS: immediate fatal diagnostic
             MetaConfigInstance::deserialize(cfg)
                 .into_diagnostic()
                 .wrap_err("Root package had [{PACKAGE_VET_CONFIG}] but it was malformed")
         })
-        .transpose()?;
+        .collect::<Result<Vec<_>, _>>()?;
 
     let cli_metacfg = cli.store_path.as_ref().map(|path| MetaConfigInstance {
         version: Some(1),
@@ -455,18 +458,19 @@ fn real_main() -> Result<(), miette::Report> {
         }),
     });
 
-    if workspace_metacfg.is_some() && package_metacfg.is_some() {
+    if workspace_metacfg.is_some() && !package_metacfgs.is_empty() {
         // ERRORS: immediate fatal diagnostic
         return Err(miette!("Both a workspace and a package defined [metadata.vet]! We don't know what that means, if you do, let us know!"));
+    }
+    if package_metacfgs.len() > 1 {
+        return Err(miette!("Multiple root packages defined [metadata.vet]! We don't know what that means, if you do, let us know!"));
     }
 
     let mut metacfgs = vec![default_config];
     if let Some(metacfg) = workspace_metacfg {
         metacfgs.push(metacfg);
     }
-    if let Some(metacfg) = package_metacfg {
-        metacfgs.push(metacfg);
-    }
+    metacfgs.extend(package_metacfgs);
     if let Some(metacfg) = cli_metacfg {
         metacfgs.push(metacfg);
     }
@@ -499,7 +503,8 @@ fn real_main() -> Result<(), miette::Report> {
 
     let cfg = Config {
         metacfg,
-        metadata,
+        package_graph,
+        resolver_version,
         _rest: partial_cfg,
     };
 
@@ -516,7 +521,6 @@ fn real_main() -> Result<(), miette::Report> {
         Some(Suggest(sub_args)) => cmd_suggest(&out, &cfg, sub_args),
         Some(Fmt(sub_args)) => cmd_fmt(&out, &cfg, sub_args),
         Some(Prune(sub_args)) => cmd_prune(&out, &cfg, sub_args),
-        Some(DumpGraph(sub_args)) => cmd_dump_graph(&out, &cfg, sub_args),
         Some(ExplainAudit(sub_args)) => cmd_explain_audit(&out, &cfg, sub_args),
         Some(Inspect(sub_args)) => cmd_inspect(&out, &cfg, sub_args),
         Some(Diff(sub_args)) => cmd_diff(&out, &cfg, sub_args),
@@ -617,15 +621,14 @@ fn cmd_inspect(
                     // actual cargo checkout, rather than our repack, which may
                     // be incomplete, and will be clobbered by GC.
                     if let Some(git_rev) = &version.git_rev {
-                        storage::locate_local_checkout(&cfg.metadata, package, version).ok_or_else(
-                            || FetchError::UnknownGitRevision {
+                        storage::locate_local_checkout(&cfg.package_graph, package, version)
+                            .ok_or_else(|| FetchError::UnknownGitRevision {
                                 package: package.to_owned(),
                                 git_rev: git_rev.to_owned(),
-                            },
-                        )
+                            })
                     } else {
                         cache
-                            .fetch_package(&cfg.metadata, network.as_ref(), package, version)
+                            .fetch_package(&cfg.package_graph, network.as_ref(), package, version)
                             .await
                     }
                 },
@@ -708,7 +711,7 @@ fn do_cmd_certify(
 
     // FIXME: can/should we check if the version makes sense..?
     if !sub_args.force
-        && !foreign_packages(&cfg.metadata, &store.config).any(|pkg| *pkg.name == *package)
+        && !foreign_packages(&cfg.package_graph, &store.config).any(|pkg| *pkg.name() == *package)
     {
         return Err(CertifyError::NotAPackage(package));
     }
@@ -1174,7 +1177,7 @@ fn guess_audit_criteria(
 ) -> Vec<String> {
     // Attempt to resolve a normal `cargo vet`, and try to find criteria which
     // would heal some errors in that result if it fails.
-    let criteria = resolver::resolve(&cfg.metadata, cfg.cli.filter_graph.as_ref(), store)
+    let criteria = resolver::resolve(&cfg.package_graph, cfg.resolver_version, store)
         .compute_suggested_criteria(package, from, to);
     if !criteria.is_empty() {
         return criteria;
@@ -1186,8 +1189,8 @@ fn guess_audit_criteria(
     // This is as much as we can do, so just return the result whether or not we
     // find anything.
     resolver::resolve(
-        &cfg.metadata,
-        cfg.cli.filter_graph.as_ref(),
+        &cfg.package_graph,
+        cfg.resolver_version,
         &store.clone_for_suggest(true),
     )
     .compute_suggested_criteria(package, from, to)
@@ -1393,8 +1396,7 @@ fn do_cmd_trust(
         // Run the resolver against the store in "suggest" mode to discover the
         // set of packages which either fail to audit or need exemptions.
         let suggest_store = store.clone_for_suggest(true);
-        let report =
-            resolver::resolve(&cfg.metadata, cfg.cli.filter_graph.as_ref(), &suggest_store);
+        let report = resolver::resolve(&cfg.package_graph, cfg.resolver_version, &suggest_store);
         let resolver::Conclusion::FailForVet(fail) = &report.conclusion else {
             return Err(miette!(
                 "No failing or exempted crates, trust --all will do nothing"
@@ -1406,12 +1408,10 @@ fn do_cmd_trust(
         let mut failed_criteria = report.criteria_mapper.no_criteria();
         let mut trust = Vec::new();
         let mut skipped = Vec::new();
-        for (failure_idx, audit_failure) in &fail.failures {
-            let package = &report.graph.nodes[*failure_idx];
-
+        for (package, audit_failure) in &fail.failures {
             // Ensure the store has publisher information for this package. This
             // is a no-op if called multiple times for the same package.
-            let publishers = store.ensure_publisher_versions(cfg, network, package.name)?;
+            let publishers = store.ensure_publisher_versions(cfg, network, package.name())?;
             let by_user = publishers
                 .iter()
                 .filter(|p| p.source.as_identifier() == publisher_identifier)
@@ -1422,9 +1422,9 @@ fn do_cmd_trust(
 
             // Record if we're skipping this package due to multiple publishers.
             if by_user != publishers.len() && !sub_args.allow_multiple_publishers {
-                skipped.push(package.name);
+                skipped.push(package.name());
             } else {
-                trust.push(package.name);
+                trust.push(package.name());
                 failed_criteria.unioned_with(&audit_failure.criteria_failures);
             }
         }
@@ -1634,7 +1634,8 @@ fn cmd_record_violation(
 
     // FIXME: can/should we check if the version makes sense..?
     if !sub_args.force
-        && !foreign_packages(&cfg.metadata, &store.config).any(|pkg| *pkg.name == sub_args.package)
+        && !foreign_packages(&cfg.package_graph, &store.config)
+            .any(|pkg| *pkg.name() == sub_args.package)
     {
         // ERRORS: immediate fatal diagnostic? should we allow you to forbid random packages?
         // You're definitely *allowed* to have unused audits, otherwise you'd be constantly deleting
@@ -1696,7 +1697,8 @@ fn cmd_add_exemption(
 
     // FIXME: can/should we check if the version makes sense..?
     if !sub_args.force
-        && !foreign_packages(&cfg.metadata, &store.config).any(|pkg| *pkg.name == sub_args.package)
+        && !foreign_packages(&cfg.package_graph, &store.config)
+            .any(|pkg| *pkg.name() == sub_args.package)
     {
         // ERRORS: immediate fatal diagnostic? should we allow you to certify random packages?
         // You're definitely *allowed* to have unused audits, otherwise you'd be constantly deleting
@@ -1739,7 +1741,7 @@ fn cmd_suggest(
     let suggest_store = Store::acquire(cfg, network.as_ref(), false)?.clone_for_suggest(true);
 
     // DO THE THING!!!!
-    let report = resolver::resolve(&cfg.metadata, cfg.cli.filter_graph.as_ref(), &suggest_store);
+    let report = resolver::resolve(&cfg.package_graph, cfg.resolver_version, &suggest_store);
     let suggest = report.compute_suggest(cfg, &suggest_store, network.as_ref())?;
     match cfg.cli.output_format {
         OutputFormat::Human => report
@@ -1934,8 +1936,8 @@ async fn fix_audit_as(
 
     let mut cache = Cache::acquire(cfg)?;
 
-    let third_party_packages = foreign_packages_strict(&cfg.metadata, &store.config)
-        .map(|p| &*p.name)
+    let third_party_packages = foreign_packages_strict(&cfg.package_graph, &store.config)
+        .map(|p| p.name())
         .collect::<SortedSet<_>>();
 
     let issues = check_audit_as_crates_io(cfg, store, network, &mut cache).await;
@@ -1943,15 +1945,14 @@ async fn fix_audit_as(
         fn get_policy_entry<'a>(
             store: &'a mut Store,
             cfg: &Config,
-            third_party_packages: &SortedSet<&String>,
+            third_party_packages: &SortedSet<&str>,
             error: &PackageError,
         ) -> &'a mut PolicyEntry {
-            let is_third_party = third_party_packages.contains(&error.package);
+            let is_third_party = third_party_packages.contains(&error.package[..]);
             let all_versions = || {
-                cfg.metadata
-                    .packages
-                    .iter()
-                    .filter(|&p| *p.name == error.package)
+                cfg.package_graph
+                    .packages()
+                    .filter(|&p| p.name() == error.package)
                     .map(|p| p.vet_version())
                     .collect()
             };
@@ -1988,8 +1989,8 @@ async fn fix_audit_as(
                         // NeedsAuditAsErrors.
                         let default_audit_as =
                             match cache.crates_io_info(network, &err.package).await {
-                                Ok(entry) => cfg.metadata.packages.iter().any(|p| {
-                                    *p.name == err.package && entry.metadata.consider_as_same(p)
+                                Ok(entry) => cfg.package_graph.packages().any(|p| {
+                                    p.name() == err.package && entry.metadata.consider_as_same(p)
                                 }),
                                 Err(e) => {
                                     warn!("crate metadata error for {}: {e}", &err.package);
@@ -2114,8 +2115,18 @@ fn cmd_diff(out: &Arc<dyn Out>, cfg: &Config, sub_args: &DiffArgs) -> Result<(),
             let (to_compare, eulas) = tokio::join!(
                 async {
                     let (pkg1, pkg2) = tokio::try_join!(
-                        cache.fetch_package(&cfg.metadata, network.as_ref(), package, version1),
-                        cache.fetch_package(&cfg.metadata, network.as_ref(), package, version2)
+                        cache.fetch_package(
+                            &cfg.package_graph,
+                            network.as_ref(),
+                            package,
+                            version1
+                        ),
+                        cache.fetch_package(
+                            &cfg.package_graph,
+                            network.as_ref(),
+                            package,
+                            version2
+                        )
                     )?;
                     let (_, to_compare) = cache
                         .diffstat_package(
@@ -2204,7 +2215,7 @@ fn cmd_check(
     }
 
     // DO THE THING!!!!
-    let report = resolver::resolve(&cfg.metadata, cfg.cli.filter_graph.as_ref(), &store);
+    let report = resolver::resolve(&cfg.package_graph, cfg.resolver_version, &store);
 
     // Bare `cargo vet` shouldn't suggest in CI
     let suggest = if !cfg.cli.locked {
@@ -2607,25 +2618,6 @@ fn do_aggregate_audits(sources: Vec<(String, AuditsFile)>) -> Result<AuditsFile,
     }
 }
 
-fn cmd_dump_graph(
-    out: &Arc<dyn Out>,
-    cfg: &Config,
-    sub_args: &DumpGraphArgs,
-) -> Result<(), miette::Report> {
-    // Dump a mermaid-js graph
-    trace!("dumping...");
-
-    let graph = resolver::DepGraph::new(&cfg.metadata, cfg.cli.filter_graph.as_ref(), None);
-    match cfg.cli.output_format {
-        OutputFormat::Human => graph.print_mermaid(out, sub_args).into_diagnostic()?,
-        OutputFormat::Json => {
-            serde_json::to_writer_pretty(&**out, &graph.nodes).into_diagnostic()?
-        }
-    }
-
-    Ok(())
-}
-
 fn explain_write_edge(
     out: &Arc<dyn Out>,
     store: &Store,
@@ -2800,10 +2792,9 @@ fn cmd_explain_audit(
         version.clone()
     } else {
         let matching_packages = cfg
-            .metadata
-            .packages
-            .iter()
-            .filter(|pkg| *pkg.name == sub_args.package)
+            .package_graph
+            .packages()
+            .filter(|pkg| pkg.name() == sub_args.package)
             .collect::<Vec<_>>();
         miette::ensure!(matching_packages.len() == 1, "Ambiguous package version");
         matching_packages[0].vet_version()
@@ -3084,38 +3075,35 @@ async fn eula_for_criteria(
 
 /// All third-party packages, with the audit-as-crates-io policy applied
 fn foreign_packages<'a>(
-    metadata: &'a Metadata,
+    package_graph: &'a PackageGraph,
     config: &'a ConfigFile,
-) -> impl Iterator<Item = &'a Package> + 'a {
+) -> impl Iterator<Item = PackageMetadata<'a>> + 'a {
     // Only analyze things from crates.io (no source = path-dep / workspace-member)
-    metadata
-        .packages
-        .iter()
+    package_graph
+        .packages()
         .filter(|package| package.is_third_party(&config.policy))
 }
 
 /// All first-party packages, **without** the audit-as-crates-io policy applied
 /// (because it's used for validating that field's value).
 fn first_party_packages_strict<'a>(
-    metadata: &'a Metadata,
+    package_graph: &'a PackageGraph,
     _config: &'a ConfigFile,
-) -> impl Iterator<Item = &'a Package> + 'a {
-    metadata
-        .packages
-        .iter()
-        .filter(move |package| !package.is_crates_io())
+) -> impl Iterator<Item = PackageMetadata<'a>> + 'a {
+    package_graph
+        .packages()
+        .filter(|package| !package.is_crates_io())
 }
 
 /// All third-party packages, **without** the audit-as-crates-io policy applied (used in crate
 /// policy verification).
 fn foreign_packages_strict<'a>(
-    metadata: &'a Metadata,
+    package_graph: &'a PackageGraph,
     _config: &ConfigFile,
-) -> impl Iterator<Item = &'a Package> + 'a {
-    metadata
-        .packages
-        .iter()
-        .filter(move |package| package.is_crates_io())
+) -> impl Iterator<Item = PackageMetadata<'a>> + 'a {
+    package_graph
+        .packages()
+        .filter(|package| package.is_crates_io())
 }
 
 async fn check_audit_as_crates_io(
@@ -3124,8 +3112,9 @@ async fn check_audit_as_crates_io(
     network: Option<&Network>,
     cache: &mut Cache,
 ) -> Result<(), AuditAsErrors> {
-    let first_party_packages: Vec<_> =
-        first_party_packages_strict(&cfg.metadata, &store.config).collect();
+    let mut first_party_packages: Vec<_> =
+        first_party_packages_strict(&cfg.package_graph, &store.config).collect();
+    first_party_packages.sort_by_key(|pkg| (pkg.name(), pkg.vet_version(), pkg.id()));
 
     let mut errors = vec![];
 
@@ -3140,8 +3129,8 @@ async fn check_audit_as_crates_io(
 
         for package in &first_party_packages {
             // Remove both versioned and unversioned entries
-            unused_audit_as.remove(&(package.name.to_string(), Some(package.vet_version())));
-            unused_audit_as.remove(&(package.name.to_string(), None));
+            unused_audit_as.remove(&(package.name().to_owned(), Some(package.vet_version())));
+            unused_audit_as.remove(&(package.name().to_owned(), None));
         }
         if !unused_audit_as.is_empty() {
             errors.push(AuditAsError::UnusedAuditAs(UnusedAuditAsErrors {
@@ -3179,7 +3168,7 @@ async fn check_audit_as_crates_io(
                 return None;
             }
 
-            let package_name = package.name.as_str();
+            let package_name = package.name();
 
             // Check for existing audits for the crate, which imply that it exists on
             // crates.io.
@@ -3196,7 +3185,7 @@ async fn check_audit_as_crates_io(
 
             let matches_crates_io_package = async {
                 cache
-                    .crates_io_info(network, &package.name)
+                    .crates_io_info(network, package.name())
                     .await
                     .is_ok_and(|entry| entry.metadata.consider_as_same(package))
             };
@@ -3233,13 +3222,13 @@ async fn check_audit_as_crates_io(
         match action {
             CheckAction::NeedAuditAs => {
                 needs_audit_as_entry.push(PackageError {
-                    package: package.name.to_string(),
+                    package: package.name().to_owned(),
                     version: Some(package.vet_version()),
                 });
             }
             CheckAction::ShouldntBeAuditAs => {
                 shouldnt_be_audit_as.push(PackageError {
-                    package: package.name.to_string(),
+                    package: package.name().to_owned(),
                     version: Some(package.vet_version()),
                 });
             }
@@ -3273,7 +3262,8 @@ async fn check_audit_as_crates_io(
 /// 2. Any versioned policies must correspond to a crate in the graph.
 fn check_crate_policies(cfg: &Config, store: &Store) -> Result<(), CratePolicyErrors> {
     // All defined policy package names (to be removed).
-    let mut policy_crates: SortedSet<&PackageName> = store.config.policy.package.keys().collect();
+    let mut policy_crates: SortedSet<PackageStr<'_>> =
+        store.config.policy.package.keys().map(|k| &k[..]).collect();
 
     // All defined policy (name, version) pairs (to be visited and removed).
     let mut versioned_policy_crates: SortedSet<(PackageName, VetVersion)> = store
@@ -3285,8 +3275,8 @@ fn check_crate_policies(cfg: &Config, store: &Store) -> Result<(), CratePolicyEr
 
     // The set of all third-party packages (for lookup of whether a crate has any third-party
     // versions in use).
-    let third_party_packages = foreign_packages_strict(&cfg.metadata, &store.config)
-        .map(|p| &p.name)
+    let third_party_packages = foreign_packages_strict(&cfg.package_graph, &store.config)
+        .map(|p| p.name())
         .collect::<SortedSet<_>>();
 
     // The set of all packages which have a `dependency-criteria` specified in a policy.
@@ -3294,34 +3284,36 @@ fn check_crate_policies(cfg: &Config, store: &Store) -> Result<(), CratePolicyEr
         .config
         .policy
         .iter()
-        .filter_map(|(name, _, entry)| (!entry.dependency_criteria.is_empty()).then_some(name))
+        .filter_map(|(name, _, entry)| (!entry.dependency_criteria.is_empty()).then_some(&name[..]))
         .collect::<SortedSet<_>>();
 
     let mut needs_policy_version_errors = Vec::new();
 
-    for package in &cfg.metadata.packages {
-        policy_crates.remove(&*package.name);
+    for package in cfg.package_graph.packages() {
+        policy_crates.remove(package.name());
 
         let versioned_policy_exists =
-            versioned_policy_crates.remove(&(package.name.to_string(), package.vet_version()));
+            versioned_policy_crates.remove(&(package.name().to_owned(), package.vet_version()));
 
         // If a crate has at least one third-party package and some crate policy specifies a
         // `dependency-criteria`, a versioned policy for all used versions must exist.
-        if third_party_packages.contains(&package.name)
-            && dependency_criteria_packages.contains(&*package.name)
+        if third_party_packages.contains(package.name())
+            && dependency_criteria_packages.contains(package.name())
             && !versioned_policy_exists
         {
             needs_policy_version_errors.push(PackageError {
-                package: package.name.to_string(),
+                package: package.name().to_string(),
                 version: Some(package.vet_version()),
             });
         }
     }
 
+    needs_policy_version_errors.sort();
+
     let unused_policy_version_errors: Vec<_> = policy_crates
         .into_iter()
         .map(|name| PackageError {
-            package: name.clone(),
+            package: name.to_owned(),
             version: None,
         })
         .chain(

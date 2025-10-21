@@ -207,33 +207,6 @@ fn test_project_suggest_json() {
 }
 
 #[test]
-fn test_project_dump_graph_full_json() {
-    let output = test_project_command(Some("dump-graph"))
-        .arg("--output-format=json")
-        .arg("--depth=full")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
-
-    insta::assert_snapshot!("test-project-dump-graph-full-json", format_outputs(&output));
-    assert!(output.status.success(), "{}", output.status);
-}
-
-#[test]
-fn test_project_dump_graph_full() {
-    let output = test_project_command(Some("dump-graph"))
-        .arg("--depth=full")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
-
-    insta::assert_snapshot!("test-project-dump-graph-full", format_outputs(&output));
-    assert!(output.status.success(), "{}", output.status);
-}
-
-#[test]
 fn test_project_bad_certify_human() {
     let output = test_project_command(Some("certify"))
         .arg("asdfsdfs")

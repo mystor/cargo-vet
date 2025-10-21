@@ -7,7 +7,6 @@ use std::{
     sync::Arc,
 };
 
-use cargo_metadata::semver;
 use miette::{Diagnostic, MietteSpanContents, SourceCode, SourceSpan};
 use thiserror::Error;
 
@@ -84,11 +83,13 @@ impl Debug for SourceFile {
 // VersionParseError
 //////////////////////////////////////////////////////////
 
+type SemverError = <guppy::Version as std::str::FromStr>::Err;
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum VersionParseError {
     #[error(transparent)]
-    Semver(#[from] semver::Error),
+    Semver(SemverError),
     #[error("unrecognized revision type, expected 'git:' prefix")]
     UnknownRevision,
     #[error("unrecognized git hash, expected 40 hex digits")]
@@ -110,23 +111,21 @@ pub enum StoreVersionParseError {
 
 #[derive(Debug, Error, Diagnostic)]
 pub enum MetadataAcquireError {
-    #[error("`cargo metadata` exited with an error:\n{stderr}")]
+    #[error("`cargo metadata` execution failed:\n{inner}")]
     #[diagnostic(help("You may need to run `cargo generate-lockfile` to create a Cargo.lock"))]
     MetadataError {
-        /// Stderr returned by the `cargo metadata` command
-        stderr: String,
+        /// Error produced when executing the `cargo metadata` command
+        inner: Box<dyn std::error::Error + Send + Sync>,
     },
     #[error(transparent)]
-    Other(cargo_metadata::Error),
+    Other(guppy::Error),
 }
 
-impl From<cargo_metadata::Error> for MetadataAcquireError {
-    fn from(value: cargo_metadata::Error) -> Self {
+impl From<guppy::Error> for MetadataAcquireError {
+    fn from(value: guppy::Error) -> Self {
         match value {
-            // Wrap normal errors to provide extra help information.
-            cargo_metadata::Error::CargoMetadata { stderr } => {
-                MetadataAcquireError::MetadataError { stderr }
-            }
+            // Wrap command errors to provide extra help information.
+            guppy::Error::CommandError(inner) => MetadataAcquireError::MetadataError { inner },
             // Other errors couldn't be caused by that problem, so are
             // unchanged.
             other => MetadataAcquireError::Other(other),
@@ -208,7 +207,7 @@ impl Display for UnusedAuditAsErrors {
     }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error, PartialEq, Eq, PartialOrd, Ord)]
 #[error("{package}{}", .version.as_ref().map(|v| format!(":{v}")).unwrap_or_default())]
 pub struct PackageError {
     pub package: PackageName,
@@ -632,7 +631,7 @@ pub enum FetchError {
     #[error("Running as --frozen but needed to fetch {package}:{version}")]
     Frozen {
         package: PackageName,
-        version: semver::Version,
+        version: guppy::Version,
     },
     #[error("Failed to unpack .crate at {}", src.display())]
     Unpack {

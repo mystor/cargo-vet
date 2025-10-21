@@ -22,7 +22,7 @@ url = 10 # invalid!
 
     let store = Store::mock_online(&cfg, config, audits, imports, &network, false).unwrap();
 
-    let report = crate::resolver::resolve(&metadata, None, &store);
+    let report = crate::resolver::resolve(&metadata, CargoResolverVersion::V2, &store);
     let suggest = report
         .compute_suggest(&cfg, &store, Some(&network))
         .unwrap();

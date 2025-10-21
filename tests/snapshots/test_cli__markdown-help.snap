@@ -37,7 +37,6 @@ cargo vet <COMMAND>
 * [prune](#cargo-vet-prune): Prune unnecessary imports and exemptions
 * [aggregate](#cargo-vet-aggregate): Fetch and merge audits from multiple sources into a single `audits.toml` file
 * [explain-audit](#cargo-vet-explain-audit): Print the computed audit path used by cargo-vet to certify a package for a given critera
-* [dump-graph](#cargo-vet-dump-graph): Print the cargo build graph as understood by `cargo vet`
 * [gc](#cargo-vet-gc): Clean up old packages from the vet cache
 * [renew](#cargo-vet-renew): Renew wildcard audit expirations
 
@@ -56,17 +55,6 @@ Path to Cargo.toml
 
 #### `--store-path <STORE_PATH>`
 Path to the supply-chain directory
-
-#### `--no-all-features`
-Don't use --all-features
-
-We default to passing --all-features to `cargo metadata` because we want to analyze your full dependency tree
-
-#### `--no-default-features`
-Do not activate the `default` feature
-
-#### `--features <FEATURES>`
-Space-separated list of features to activate
 
 #### `--locked`
 Do not fetch new imported audits
@@ -107,49 +95,6 @@ Use the following path instead of the global cache directory
 The cache stores information such as the summary results used by vet's suggestion machinery, cached results from crates.io APIs, and checkouts of crates from crates.io in some cases. This is generally automatically managed in the system cache directory.
 
 This mostly exists for testing vet itself.
-
-#### `--filter-graph <FILTER_GRAPH>`
-Filter out different parts of the build graph and pretend that's the true graph
-
-Example: `--filter-graph="exclude(any(eq(is_dev_only(true)),eq(name(serde_derive))))"`
-
-This mostly exists to debug or reduce projects that cargo-vet is mishandling.
-Combining this with `cargo vet --output-format=json dump-graph` can produce an
-input that can be added to vet's test suite.
-
-
-The resulting graph is computed as follows:
-
-1. First compute the original graph
-2. Then apply the filters to find the new set of nodes
-3. Create a new empty graph
-4. For each workspace member that still exists, recursively add it and its dependencies
-
-This means that any non-workspace package that becomes "orphaned" by the filters will
-be implicitly discarded even if it passes the filters.
-
-Possible filters:
-
-* `include($query)`: only include packages that match this filter
-* `exclude($query)`: exclude packages that match this filter
-
-
-Possible queries:
-
-* `any($query1, $query2, ...)`: true if any of the listed queries are true
-* `all($query1, $query2, ...)`: true if all of the listed queries are true
-* `not($query)`: true if the query is false
-* `$property`: true if the package has this property
-
-
-Possible properties:
-
-* `name($string)`: the package's name (i.e. `serde`)
-* `version($version)`: the package's version (i.e. `1.2.0`)
-* `is_root($bool)`: whether it's a root in the original graph (ignoring dev-deps)
-* `is_workspace_member($bool)`: whether the package is a workspace-member (can be tested)
-* `is_third_party($bool)`: whether the package is considered third-party by vet
-* `is_dev_only($bool)`: whether it's only used by dev (test) builds in the original graph
 
 #### `--cargo-arg <CARGO_ARG>`
 Arguments to pass through to cargo. It can be specified multiple times for multiple arguments.
@@ -781,37 +726,6 @@ The criteria to display the audit path for
 #### `[default: safe-to-deploy]`
 
 ### Options
-
-#### `-h, --help`
-Print help (see a summary with '-h')
-
-### Global Options
-This subcommand accepts all the [global options](#global-options)
-
-<br><br><br>
-## cargo vet dump-graph
-Print the cargo build graph as understood by `cargo vet`
-
-This is a debugging command, the output's format is not guaranteed. Use `cargo metadata` to get a stable version of what *cargo* thinks the build graph is. Our graph is based on that result.
-
-With `--output-format=human` (the default) this will print out mermaid-js diagrams, which things like github natively support rendering of.
-
-With `--output-format=json` we will print out more raw statistics for you to search/analyze.
-
-Most projects will have unreadably complex build graphs, so you may want to use the global `--filter-graph` argument to narrow your focus on an interesting subgraph. `--filter-graph` is applied *before* doing any semantic analysis, so if you filter out a package and it was the problem, the problem will disappear. This can be used to bisect a problem if you get ambitious enough with your filters.
-
-### Usage
-```
-cargo vet dump-graph [OPTIONS]
-```
-
-### Options
-
-#### `--depth <DEPTH>`
-The depth of the graph to print (for a large project, the full graph is a HUGE MESS)
-
-\[default: first-party]  
-\[possible values: roots, workspace, first-party, first-party-and-directs, full]  
 
 #### `-h, --help`
 Print help (see a summary with '-h')

@@ -8,9 +8,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use cargo_metadata::semver;
 use flate2::read::GzDecoder;
 use futures_util::future::{join_all, try_join_all};
+use guppy::graph::PackageGraph;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use similar::{udiff::unified_diff, Algorithm};
@@ -280,7 +280,7 @@ impl Store {
         let mut live_imports =
             process_imported_audits(fetched_audits, &self.imports, allow_criteria_changes)?;
         import_unpublished_entries(
-            &cfg.metadata,
+            &cfg.package_graph,
             network,
             cache,
             &self.config,
@@ -290,7 +290,7 @@ impl Store {
         .await
         .map_err(Box::new)?;
         import_publisher_versions(
-            &cfg.metadata,
+            &cfg.package_graph,
             network,
             cache,
             &wildcard_audits_packages(&self.audits, &live_imports),
@@ -345,7 +345,7 @@ impl Store {
         let cache = Cache::acquire(cfg).map_err(Box::new)?;
         tokio::runtime::Handle::current()
             .block_on(import_unpublished_entries(
-                &cfg.metadata,
+                &cfg.package_graph,
                 network,
                 &cache,
                 &config,
@@ -355,7 +355,7 @@ impl Store {
             .map_err(Box::new)?;
         tokio::runtime::Handle::current()
             .block_on(import_publisher_versions(
-                &cfg.metadata,
+                &cfg.package_graph,
                 network,
                 &cache,
                 &wildcard_audits_packages(&audits, &live_imports),
@@ -745,7 +745,7 @@ impl Store {
         if let (Some(network), Some(live_imports)) = (network, self.live_imports.as_mut()) {
             let cache = Cache::acquire(cfg)?;
             tokio::runtime::Handle::current().block_on(import_publisher_versions(
-                &cfg.metadata,
+                &cfg.package_graph,
                 network,
                 &cache,
                 &[package.to_owned()].into_iter().collect(),
@@ -827,7 +827,7 @@ impl Store {
             .cloned()
             .collect::<FastSet<_>>();
         import_publisher_versions(
-            &cfg.metadata,
+            &cfg.package_graph,
             network,
             cache,
             &wildcard_packages,
@@ -1401,7 +1401,7 @@ fn parse_imported_trust_entry(
 }
 
 async fn import_unpublished_entries(
-    metadata: &cargo_metadata::Metadata,
+    package_graph: &PackageGraph,
     network: &Network,
     cache: &Cache,
     config_file: &ConfigFile,
@@ -1416,37 +1416,37 @@ async fn import_unpublished_entries(
     // Find all packages which are forced to be audit-as-crates-io, and check if
     // they are actually published. We also skip git versions, as those can
     // always be audit-as-crates-io.
-    let audit_as_packages = crate::first_party_packages_strict(metadata, config_file)
+    let audit_as_packages = crate::first_party_packages_strict(package_graph, config_file)
         .filter(|package| package.is_third_party(&config_file.policy))
         .filter(|package| package.git_rev().is_none());
     for package in audit_as_packages {
         // If we have no versions for the crate, it cannot be
         // audit-as-crates-io, so treat it as an error.
         // FIXME: better errors here?
-        let versions = cache.published_versions(network, &package.name).await?;
+        let versions = cache.published_versions(network, package.name()).await?;
 
         // Pick which verison of the crate we'd audit as. We prefer the exact
         // version of the crate, followed by the largest version below, and then
         // finally the smallest version above.
-        let max_below = versions.keys().filter(|&v| v <= &package.version).max();
+        let max_below = versions.keys().filter(|&v| v <= package.version()).max();
         let audited_as = max_below
-            .or_else(|| versions.keys().filter(|&v| v > &package.version).min())
+            .or_else(|| versions.keys().filter(|&v| v > package.version()).min())
             .expect("There must be at least one version");
 
         // The exact version is published, no unpublished entries are required.
-        if audited_as == &package.version {
+        if audited_as == package.version() {
             continue;
         }
 
         let unpublished = live_imports
             .unpublished
-            .entry(package.name.to_string())
+            .entry(package.name().to_string())
             .or_default();
 
         // Mark each existing entry for this version as `still_unpublished`, as
         // we now know this version is still unpublished.
         for entry in &mut *unpublished {
-            if entry.version.equals_semver(&package.version) {
+            if entry.version.equals_semver(package.version()) {
                 entry.still_unpublished = true;
             }
         }
@@ -1496,7 +1496,7 @@ fn wildcard_audits_packages(
 
 #[allow(clippy::too_many_arguments)]
 async fn import_publisher_versions(
-    metadata: &cargo_metadata::Metadata,
+    package_graph: &PackageGraph,
     network: &Network,
     cache: &Cache,
     relevant_packages: &FastSet<PackageName>,
@@ -1514,13 +1514,12 @@ async fn import_publisher_versions(
             .map(|pkg_name| &pkg_name[..])
             .collect()
     } else {
-        metadata
-            .packages
-            .iter()
+        package_graph
+            .packages()
             .filter(|pkg| {
-                relevant_packages.contains(&*pkg.name) && pkg.is_third_party(&config_file.policy)
+                relevant_packages.contains(pkg.name()) && pkg.is_third_party(&config_file.policy)
             })
-            .map(|pkg| &pkg.name[..])
+            .map(|pkg| pkg.name())
             .collect()
     };
 
@@ -1612,7 +1611,7 @@ pub fn user_info_map(imports: &ImportsFile) -> FastMap<CratesUserId, CratesCache
     user_info
 }
 
-type PublishedVersions = Arc<SortedMap<semver::Version, crates_index::Version>>;
+type PublishedVersions = Arc<SortedMap<guppy::Version, crates_index::Version>>;
 
 struct CacheState {
     /// The loaded DiffCache, will be persisted between invocations
@@ -1786,10 +1785,10 @@ impl Cache {
         })
     }
 
-    #[tracing::instrument(skip(self, metadata, network), err)]
+    #[tracing::instrument(skip(self, package_graph, network), err)]
     pub async fn fetch_package(
         &self,
-        metadata: &cargo_metadata::Metadata,
+        package_graph: &guppy::graph::PackageGraph,
         network: Option<&Network>,
         package: PackageStr<'_>,
         version: &VetVersion,
@@ -1826,7 +1825,7 @@ impl Cache {
                     }
 
                     // We don't have a cached re-pack - repack again ourselves.
-                    let checkout_path = locate_local_checkout(metadata, package, version)
+                    let checkout_path = locate_local_checkout(package_graph, package, version)
                         .ok_or_else(|| FetchError::UnknownGitRevision {
                             package: package.to_owned(),
                             git_rev: git_rev.to_owned(),
@@ -2049,10 +2048,10 @@ impl Cache {
         Ok((diffstat, to_compare))
     }
 
-    #[tracing::instrument(skip(self, metadata, network), err)]
+    #[tracing::instrument(skip(self, package_graph, network), err)]
     pub async fn fetch_and_diffstat_package(
         &self,
-        metadata: &cargo_metadata::Metadata,
+        package_graph: &guppy::graph::PackageGraph,
         network: Option<&Network>,
         package: PackageStr<'_>,
         delta: &Delta,
@@ -2107,11 +2106,14 @@ impl Cache {
         let diffstat = once_cell
             .get_or_try_init(|| async {
                 let from = match &delta.from {
-                    Some(from) => self.fetch_package(metadata, network, package, from).await?,
+                    Some(from) => {
+                        self.fetch_package(package_graph, network, package, from)
+                            .await?
+                    }
                     None => self.root.as_ref().unwrap().join(CACHE_EMPTY_PACKAGE),
                 };
                 let to = self
-                    .fetch_package(metadata, network, package, &delta.to)
+                    .fetch_package(package_graph, network, package, &delta.to)
                     .await?;
 
                 // Have fetches, do a real diffstat
@@ -2385,7 +2387,7 @@ impl Cache {
 
                 let mut result = SortedMap::new();
                 for version_entry in crate_entry.versions() {
-                    match semver::Version::parse(version_entry.version()) {
+                    match guppy::Version::parse(version_entry.version()) {
                         Ok(version) => {
                             result.insert(version, version_entry.clone());
                         }
@@ -2576,10 +2578,10 @@ impl Cache {
 /// Queries a package in the crates.io registry for a specific published version
 pub fn exact_version<'a>(
     this: &'a crates_index::Crate,
-    target_version: &semver::Version,
+    target_version: &guppy::Version,
 ) -> Option<&'a crates_index::Version> {
     for index_version in this.versions() {
-        if let Ok(index_ver) = index_version.version().parse::<semver::Version>() {
+        if let Ok(index_ver) = index_version.version().parse::<guppy::Version>() {
             if &index_ver == target_version {
                 return Some(index_version);
             }
@@ -2591,18 +2593,18 @@ pub fn exact_version<'a>(
 /// Locate the checkout path for the given package and version if it is part of
 /// the local build graph. Returns `None` if a local checkout cannot be found.
 pub fn locate_local_checkout(
-    metadata: &cargo_metadata::Metadata,
+    package_graph: &guppy::graph::PackageGraph,
     package: PackageStr<'_>,
     version: &VetVersion,
 ) -> Option<PathBuf> {
-    for pkg in &metadata.packages {
-        if *pkg.name == package && &pkg.vet_version() == version {
+    for pkg in package_graph.packages() {
+        if pkg.name() == package && &pkg.vet_version() == version {
             assert_eq!(
-                pkg.manifest_path.file_name(),
+                pkg.manifest_path().file_name(),
                 Some(CARGO_TOML_FILE),
                 "unexpected manifest file name"
             );
-            return Some(pkg.manifest_path.parent().map(PathBuf::from).unwrap());
+            return Some(pkg.manifest_path().parent().map(PathBuf::from).unwrap());
         }
     }
     None

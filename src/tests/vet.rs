@@ -2634,3 +2634,27 @@ fn builtin_simple_registry_suggestions() {
         Some(&network)
     );
 }
+
+#[test]
+fn feature_tree_no_exemptions() {
+    // (Fail) Should look the same as a fresh 'vet init' but with all 'exemptions' entries deleted.
+
+    let _enter = TEST_RUNTIME.enter();
+    let mock = MockMetadata::feature_tree();
+
+    let metadata = mock.metadata();
+    let (mut config, audits, imports) = files_no_exemptions(&metadata);
+
+    config.policy.insert(
+        "root-a".to_owned(),
+        PackagePolicyEntry::Unversioned(PolicyEntry {
+            criteria: Some(vec!["fuzzed".to_owned().into()]),
+            dev_criteria: Some(vec![]),
+            ..Default::default()
+        }),
+    );
+
+    let store = Store::mock(config, audits, imports);
+
+    assert_report_snapshot!("feature-tree-no-exemptions", metadata, store);
+}

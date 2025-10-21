@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use cargo_metadata::{semver, Package};
+use guppy::graph::PackageMetadata;
 use serde::{de, de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 
 // Collections based on how we're using, so it's easier to swap them out.
@@ -32,20 +32,20 @@ pub type CratesTrustpubSignature = String;
 
 // newtype VersionReq so that we can implement PartialOrd on it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VersionReq(pub semver::VersionReq);
+pub struct VersionReq(pub guppy::VersionReq);
 impl fmt::Display for VersionReq {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 impl FromStr for VersionReq {
-    type Err = <semver::VersionReq as FromStr>::Err;
+    type Err = <guppy::VersionReq as FromStr>::Err;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        semver::VersionReq::from_str(s).map(VersionReq)
+        guppy::VersionReq::from_str(s).map(VersionReq)
     }
 }
 impl core::ops::Deref for VersionReq {
-    type Target = semver::VersionReq;
+    type Target = guppy::VersionReq;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -57,7 +57,7 @@ impl cmp::PartialOrd for VersionReq {
 }
 impl VersionReq {
     pub fn parse(text: &str) -> Result<Self, <Self as FromStr>::Err> {
-        cargo_metadata::semver::VersionReq::parse(text).map(VersionReq)
+        guppy::VersionReq::parse(text).map(VersionReq)
     }
     pub fn matches(&self, version: &VetVersion) -> bool {
         self.0.matches(&version.semver)
@@ -66,7 +66,7 @@ impl VersionReq {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VetVersion {
-    pub semver: semver::Version,
+    pub semver: guppy::Version,
     pub git_rev: Option<String>,
 }
 impl VetVersion {
@@ -77,7 +77,7 @@ impl VetVersion {
                     Err(VersionParseError::InvalidGitHash)
                 } else {
                     Ok(VetVersion {
-                        semver: ver.trim_end().parse()?,
+                        semver: ver.trim_end().parse().map_err(VersionParseError::Semver)?,
                         git_rev: Some(hash.to_owned()),
                     })
                 }
@@ -86,7 +86,7 @@ impl VetVersion {
             }
         } else {
             Ok(VetVersion {
-                semver: s.parse()?,
+                semver: s.parse().map_err(VersionParseError::Semver)?,
                 git_rev: None,
             })
         }
@@ -94,13 +94,13 @@ impl VetVersion {
 
     /// Check if this VetVersion exactly matches the given semver version with
     /// no git revision metadata.
-    pub fn equals_semver(&self, semver: &semver::Version) -> bool {
+    pub fn equals_semver(&self, semver: &guppy::Version) -> bool {
         self.git_rev.is_none() && &self.semver == semver
     }
 
     /// Get this VetVersion as a semver::Version, returning None if this version
     /// corresponds to a git revision.
-    pub fn as_semver(&self) -> Option<&semver::Version> {
+    pub fn as_semver(&self) -> Option<&guppy::Version> {
         if self.git_rev.is_none() {
             Some(&self.semver)
         } else {
@@ -1293,7 +1293,7 @@ pub struct CratesCacheVersionDetails {
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct CratesCacheEntry {
-    pub versions: SortedMap<semver::Version, CratesCacheVersionDetails>,
+    pub versions: SortedMap<guppy::Version, CratesCacheVersionDetails>,
     pub metadata: CratesAPICrateMetadata,
 }
 
@@ -1345,7 +1345,7 @@ impl CratesAPITrustpubData {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CratesAPIVersion {
     pub created_at: chrono::DateTime<chrono::Utc>,
-    pub num: semver::Version,
+    pub num: guppy::Version,
     pub published_by: Option<CratesAPIUser>,
     pub trustpub_data: Option<CratesAPITrustpubData>,
 }
@@ -1368,9 +1368,9 @@ pub struct CratesAPICrate {
 impl CratesAPICrateMetadata {
     /// Whether this metadata is similar enough to that of the given package to be considered the
     /// same.
-    pub fn consider_as_same(&self, p: &Package) -> bool {
-        (self.description.is_some() && p.description == self.description)
-            || (self.repository.is_some() && p.repository == self.repository)
+    pub fn consider_as_same(&self, p: PackageMetadata<'_>) -> bool {
+        (self.description.is_some() && p.description() == self.description.as_deref())
+            || (self.repository.is_some() && p.repository() == self.repository.as_deref())
     }
 }
 

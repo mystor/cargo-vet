@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr};
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -38,24 +38,6 @@ pub struct Cli {
     #[clap(long, name = "STORE_PATH")]
     #[clap(help_heading = "Global Options", global = true)]
     pub store_path: Option<PathBuf>,
-
-    /// Don't use --all-features
-    ///
-    /// We default to passing --all-features to `cargo metadata`
-    /// because we want to analyze your full dependency tree
-    #[clap(long, action)]
-    #[clap(help_heading = "Global Options", global = true)]
-    pub no_all_features: bool,
-
-    /// Do not activate the `default` feature
-    #[clap(long, action)]
-    #[clap(help_heading = "Global Options", global = true)]
-    pub no_default_features: bool,
-
-    /// Space-separated list of features to activate
-    #[clap(long, action, value_delimiter = ' ')]
-    #[clap(help_heading = "Global Options", global = true)]
-    pub features: Vec<String>,
 
     /// Do not fetch new imported audits.
     #[clap(long, action)]
@@ -119,52 +101,6 @@ pub struct Cli {
     #[clap(long, action, hide = true)]
     #[clap(help_heading = "Global Options", global = true)]
     pub current_time: Option<chrono::DateTime<chrono::Utc>>,
-
-    /// Filter out different parts of the build graph and pretend that's the true graph
-    ///
-    /// Example: `--filter-graph="exclude(any(eq(is_dev_only(true)),eq(name(serde_derive))))"`
-    ///
-    /// This mostly exists to debug or reduce projects that cargo-vet is mishandling.
-    /// Combining this with `cargo vet --output-format=json dump-graph` can produce an
-    /// input that can be added to vet's test suite.
-    ///
-    ///
-    /// The resulting graph is computed as follows:
-    ///
-    /// 1. First compute the original graph
-    /// 2. Then apply the filters to find the new set of nodes
-    /// 3. Create a new empty graph
-    /// 4. For each workspace member that still exists, recursively add it and its dependencies
-    ///
-    /// This means that any non-workspace package that becomes "orphaned" by the filters will
-    /// be implicitly discarded even if it passes the filters.
-    ///
-    /// Possible filters:
-    ///
-    /// * `include($query)`: only include packages that match this filter
-    /// * `exclude($query)`: exclude packages that match this filter
-    ///
-    ///
-    /// Possible queries:
-    ///
-    /// * `any($query1, $query2, ...)`: true if any of the listed queries are true
-    /// * `all($query1, $query2, ...)`: true if all of the listed queries are true
-    /// * `not($query)`: true if the query is false
-    /// * `$property`: true if the package has this property
-    ///
-    ///
-    /// Possible properties:
-    ///
-    /// * `name($string)`: the package's name (i.e. `serde`)
-    /// * `version($version)`: the package's version (i.e. `1.2.0`)
-    /// * `is_root($bool)`: whether it's a root in the original graph (ignoring dev-deps)
-    /// * `is_workspace_member($bool)`: whether the package is a workspace-member (can be tested)
-    /// * `is_third_party($bool)`: whether the package is considered third-party by vet
-    /// * `is_dev_only($bool)`: whether it's only used by dev (test) builds in the original graph
-    #[clap(long, action)]
-    #[clap(verbatim_doc_comment)]
-    #[clap(help_heading = "Global Options", global = true)]
-    pub filter_graph: Option<Vec<GraphFilter>>,
 
     /// Arguments to pass through to cargo. It can be specified multiple times for
     /// multiple arguments.
@@ -374,26 +310,6 @@ pub enum Commands {
     /// This is a debugging command, and the output's format is not guaranteed.
     #[clap(disable_version_flag = true)]
     ExplainAudit(ExplainAuditArgs),
-
-    /// Print the cargo build graph as understood by `cargo vet`
-    ///
-    /// This is a debugging command, the output's format is not guaranteed.
-    /// Use `cargo metadata` to get a stable version of what *cargo* thinks the
-    /// build graph is. Our graph is based on that result.
-    ///
-    /// With `--output-format=human` (the default) this will print out mermaid-js
-    /// diagrams, which things like github natively support rendering of.
-    ///
-    /// With `--output-format=json` we will print out more raw statistics for you
-    /// to search/analyze.
-    ///
-    /// Most projects will have unreadably complex build graphs, so you may want to
-    /// use the global `--filter-graph` argument to narrow your focus on an interesting
-    /// subgraph. `--filter-graph` is applied *before* doing any semantic analysis,
-    /// so if you filter out a package and it was the problem, the problem will disappear.
-    /// This can be used to bisect a problem if you get ambitious enough with your filters.
-    #[clap(disable_version_flag = true)]
-    DumpGraph(DumpGraphArgs),
 
     /// Print --help as markdown (for generating docs)
     ///
@@ -827,164 +743,6 @@ pub enum OutputFormat {
     Human,
     /// Print output in a machine-readable form with minimal extra context.
     Json,
-}
-
-#[derive(Clone, Debug)]
-pub enum GraphFilter {
-    Include(GraphFilterQuery),
-    Exclude(GraphFilterQuery),
-}
-
-#[derive(Clone, Debug)]
-pub enum GraphFilterQuery {
-    Any(Vec<GraphFilterQuery>),
-    All(Vec<GraphFilterQuery>),
-    Not(Box<GraphFilterQuery>),
-    Prop(GraphFilterProperty),
-}
-
-#[derive(Clone, Debug)]
-pub enum GraphFilterProperty {
-    Name(PackageName),
-    Version(VetVersion),
-    IsRoot(bool),
-    IsWorkspaceMember(bool),
-    IsThirdParty(bool),
-    IsDevOnly(bool),
-}
-
-impl FromStr for GraphFilter {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        use nom::{
-            branch::alt,
-            bytes::complete::{is_not, tag},
-            character::complete::multispace0,
-            combinator::{all_consuming, cut},
-            error::{convert_error, ParseError, VerboseError, VerboseErrorKind},
-            multi::separated_list1,
-            sequence::delimited,
-            Finish, IResult,
-        };
-        type ParseResult<I, O> = IResult<I, O, VerboseError<I>>;
-
-        fn parse(input: &str) -> ParseResult<&str, GraphFilter> {
-            all_consuming(alt((include_filter, exclude_filter)))(input)
-        }
-        fn include_filter(input: &str) -> ParseResult<&str, GraphFilter> {
-            let (rest, val) =
-                delimited(ws(tag("include(")), cut(filter_query), ws(tag(")")))(input)?;
-            Ok((rest, GraphFilter::Include(val)))
-        }
-        fn exclude_filter(input: &str) -> ParseResult<&str, GraphFilter> {
-            let (rest, val) =
-                delimited(ws(tag("exclude(")), cut(filter_query), ws(tag(")")))(input)?;
-            Ok((rest, GraphFilter::Exclude(val)))
-        }
-        fn filter_query(input: &str) -> ParseResult<&str, GraphFilterQuery> {
-            alt((any_query, all_query, not_query, prop_query))(input)
-        }
-        fn any_query(input: &str) -> ParseResult<&str, GraphFilterQuery> {
-            let (rest, val) = delimited(
-                ws(tag("any(")),
-                cut(separated_list1(tag(","), cut(filter_query))),
-                ws(tag(")")),
-            )(input)?;
-            Ok((rest, GraphFilterQuery::Any(val)))
-        }
-        fn all_query(input: &str) -> ParseResult<&str, GraphFilterQuery> {
-            let (rest, val) = delimited(
-                ws(tag("all(")),
-                cut(separated_list1(tag(","), cut(filter_query))),
-                ws(tag(")")),
-            )(input)?;
-            Ok((rest, GraphFilterQuery::All(val)))
-        }
-        fn not_query(input: &str) -> ParseResult<&str, GraphFilterQuery> {
-            let (rest, val) = delimited(ws(tag("not(")), cut(filter_query), ws(tag(")")))(input)?;
-            Ok((rest, GraphFilterQuery::Not(Box::new(val))))
-        }
-        fn prop_query(input: &str) -> ParseResult<&str, GraphFilterQuery> {
-            let (rest, val) = filter_property(input)?;
-            Ok((rest, GraphFilterQuery::Prop(val)))
-        }
-        fn filter_property(input: &str) -> ParseResult<&str, GraphFilterProperty> {
-            alt((
-                prop_name,
-                prop_version,
-                prop_is_root,
-                prop_is_workspace_member,
-                prop_is_third_party,
-                prop_is_dev_only,
-            ))(input)
-        }
-        fn prop_name(input: &str) -> ParseResult<&str, GraphFilterProperty> {
-            let (rest, val) =
-                delimited(ws(tag("name(")), cut(val_package_name), ws(tag(")")))(input)?;
-            Ok((rest, GraphFilterProperty::Name(val.to_string())))
-        }
-        fn prop_version(input: &str) -> ParseResult<&str, GraphFilterProperty> {
-            let (rest, val) =
-                delimited(ws(tag("version(")), cut(val_version), ws(tag(")")))(input)?;
-            Ok((rest, GraphFilterProperty::Version(val)))
-        }
-        fn prop_is_root(input: &str) -> ParseResult<&str, GraphFilterProperty> {
-            let (rest, val) = delimited(ws(tag("is_root(")), cut(val_bool), ws(tag(")")))(input)?;
-            Ok((rest, GraphFilterProperty::IsRoot(val)))
-        }
-        fn prop_is_workspace_member(input: &str) -> ParseResult<&str, GraphFilterProperty> {
-            let (rest, val) =
-                delimited(ws(tag("is_workspace_member(")), cut(val_bool), ws(tag(")")))(input)?;
-            Ok((rest, GraphFilterProperty::IsWorkspaceMember(val)))
-        }
-        fn prop_is_third_party(input: &str) -> ParseResult<&str, GraphFilterProperty> {
-            let (rest, val) =
-                delimited(ws(tag("is_third_party(")), cut(val_bool), ws(tag(")")))(input)?;
-            Ok((rest, GraphFilterProperty::IsThirdParty(val)))
-        }
-        fn prop_is_dev_only(input: &str) -> ParseResult<&str, GraphFilterProperty> {
-            let (rest, val) =
-                delimited(ws(tag("is_dev_only(")), cut(val_bool), ws(tag(")")))(input)?;
-            Ok((rest, GraphFilterProperty::IsDevOnly(val)))
-        }
-        fn val_bool(input: &str) -> ParseResult<&str, bool> {
-            alt((val_true, val_false))(input)
-        }
-        fn val_true(input: &str) -> ParseResult<&str, bool> {
-            let (rest, _val) = ws(tag("true"))(input)?;
-            Ok((rest, true))
-        }
-        fn val_false(input: &str) -> ParseResult<&str, bool> {
-            let (rest, _val) = ws(tag("false"))(input)?;
-            Ok((rest, false))
-        }
-        fn val_package_name(input: &str) -> ParseResult<&str, &str> {
-            is_not(") ")(input)
-        }
-        fn val_version(input: &str) -> ParseResult<&str, VetVersion> {
-            let (rest, val) = is_not(") ")(input)?;
-            let val = VetVersion::from_str(val).map_err(|_e| {
-                nom::Err::Failure(VerboseError {
-                    errors: vec![(val, VerboseErrorKind::Context("version parse error"))],
-                })
-            })?;
-            Ok((rest, val))
-        }
-        fn ws<'a, F, O, E: ParseError<&'a str>>(
-            inner: F,
-        ) -> impl FnMut(&'a str) -> IResult<&'a str, O, E>
-        where
-            F: Fn(&'a str) -> IResult<&'a str, O, E>,
-        {
-            delimited(multispace0, inner, multispace0)
-        }
-
-        match parse(s).finish() {
-            Ok((_remaining, val)) => Ok(val),
-            Err(e) => Err(convert_error(s, e)),
-        }
-    }
 }
 
 /// Crate-local definition of the LevelFilter type to support

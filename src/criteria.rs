@@ -213,7 +213,7 @@ impl CriteriaSet {
     pub fn has_criteria(&self, idx: usize) -> bool {
         (self.0 & (1 << idx)) != 0
     }
-    pub fn _intersected_with(&mut self, other: &CriteriaSet) {
+    pub fn intersected_with(&mut self, other: &CriteriaSet) {
         self.0 &= other.0;
     }
     pub fn unioned_with(&mut self, other: &CriteriaSet) {

@@ -1,0 +1,27 @@
+---
+source: src/tests/vet.rs
+expression: human
+---
+Vetting Failed!
+
+3 unvetted dependencies:
+  shared:10.0.0 missing ["fuzzed", "reviewed"]
+  third-1:10.0.0 missing ["fuzzed"]
+  third-2:10.0.0 missing ["reviewed"]
+
+recommended audits for fuzzed:
+    Command                           Publisher  Used By  Audit Size
+    cargo vet inspect third-1 10.0.0  UNKNOWN    shared   100 lines
+
+recommended audits for fuzzed, reviewed (or strong-reviewed):
+    Command                          Publisher  Used By            Audit Size
+    cargo vet inspect shared 10.0.0  UNKNOWN    root-a and root-b  100 lines
+
+recommended audits for reviewed (or strong-reviewed):
+    Command                           Publisher  Used By  Audit Size
+    cargo vet inspect third-2 10.0.0  UNKNOWN    shared   100 lines
+
+estimated audit backlog: 300 lines
+
+Use |cargo vet certify| to record the audits.
+
