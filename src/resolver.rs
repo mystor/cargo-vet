@@ -372,7 +372,7 @@ pub fn resolve<'a>(
     // in Cargo.toml!
     let requirements = resolve_requirements(
         package_graph,
-        &store.config.policy,
+        &store.config,
         &criteria_mapper,
         resolver_version,
     );
@@ -416,7 +416,7 @@ fn is_link_enabled(
 }
 
 fn resolve_requirements_for_build<'g>(
-    policy: &Policy,
+    config_file: &ConfigFile,
     criteria_mapper: &CriteriaMapper,
     initials: FeatureSet<'g>,
     platform: &PlatformSpec,
@@ -445,9 +445,15 @@ fn resolve_requirements_for_build<'g>(
         .expect("FeatureSet::into_cargo_set cannot fail unless an invalid PackageId is excluded");
 
     let initial_criteria = if dev_pass {
-        criteria_mapper.criteria_from_list([format::DEFAULT_POLICY_DEV_CRITERIA])
+        match &config_file.root_policy.dev_criteria {
+            Some(dev_criteria) => criteria_mapper.criteria_from_list(dev_criteria),
+            None => criteria_mapper.criteria_from_list([format::DEFAULT_POLICY_DEV_CRITERIA]),
+        }
     } else {
-        criteria_mapper.criteria_from_list([format::DEFAULT_POLICY_CRITERIA])
+        match &config_file.root_policy.criteria {
+            Some(criteria) => criteria_mapper.criteria_from_list(criteria),
+            None => criteria_mapper.criteria_from_list([format::DEFAULT_POLICY_CRITERIA]),
+        }
     };
 
     // Use our initials set to populate the first set of todo items.
@@ -481,7 +487,7 @@ fn resolve_requirements_for_build<'g>(
             criteria = ?todo.criteria
         );
 
-        let self_policy = todo.package.policy_entry(policy);
+        let self_policy = todo.package.policy_entry(&config_file.policy);
 
         let build_platform = if todo.package.is_proc_macro() {
             BuildPlatform::Host
@@ -541,7 +547,7 @@ fn resolve_requirements_for_build<'g>(
         // We're making progress, record the new required criteria for the
         // package in `out_requirements` if the crate is third-party.
         // First party crates do not contribute to audit requirements.
-        if todo.package.is_third_party(policy) {
+        if todo.package.is_third_party(&config_file.policy) {
             out_requirements
                 .entry(todo.package.id())
                 .or_insert_with(|| criteria_mapper.no_criteria())
@@ -596,7 +602,7 @@ fn resolve_requirements_for_build<'g>(
 
 fn resolve_requirements<'g>(
     package_graph: &'g PackageGraph,
-    policy: &Policy,
+    config_file: &ConfigFile,
     criteria_mapper: &CriteriaMapper,
     resolver_version: CargoResolverVersion,
 ) -> FastMap<&'g PackageId, CriteriaSet> {
@@ -615,7 +621,7 @@ fn resolve_requirements<'g>(
     // criteria, respecting config options.
     debug!("simulating --workspace dev build (dev_pass)");
     resolve_requirements_for_build(
-        policy,
+            config_file,
         criteria_mapper,
         workspace_set.to_feature_set(StandardFeatures::All),
         &platform_spec,
@@ -630,7 +636,7 @@ fn resolve_requirements<'g>(
     for root in workspace_set.root_packages(DependencyDirection::Forward) {
         debug!("simulating target build of root package: {}", root.id());
         resolve_requirements_for_build(
-            policy,
+                config_file,
             criteria_mapper,
             root.to_feature_set(StandardFeatures::All),
             &platform_spec,
@@ -2605,7 +2611,7 @@ pub(crate) fn get_store_updates(
     // in Cargo.toml!
     let requirements = resolve_requirements(
         &cfg.package_graph,
-        &store.config.policy,
+        &store.config,
         &criteria_mapper,
         cfg.resolver_version,
     );

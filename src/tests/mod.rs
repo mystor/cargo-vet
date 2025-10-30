@@ -1131,6 +1131,7 @@ fn init_files(
         default_criteria: default_criteria.to_owned(),
         imports: Default::default(),
         policy: Default::default(),
+        root_policy: Default::default(),
         exemptions: Default::default(),
     };
     let audits = AuditsFile {
@@ -1147,21 +1148,8 @@ fn init_files(
 
     // Make the root packages use our custom criteria instead of the builtins
     if default_criteria != SAFE_TO_DEPLOY {
-        for package in metadata
-            .resolve_workspace()
-            .root_packages(DependencyDirection::Forward)
-        {
-            config.policy.insert(
-                package.name().to_string(),
-                PackagePolicyEntry::Unversioned(PolicyEntry {
-                    audit_as_crates_io: None,
-                    criteria: Some(vec![default_criteria.to_string().into()]),
-                    dev_criteria: None, // Some(vec![default_criteria.to_string().into()]),
-                    dependency_criteria: CriteriaMap::new(),
-                    notes: None,
-                }),
-            );
-        }
+        config.root_policy.criteria = Some(vec![default_criteria.to_string().into()]);
+        config.root_policy.dev_criteria = Some(vec![]);
     }
 
     // Use `update_store` to generate exemptions which would allow the tree to

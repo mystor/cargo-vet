@@ -603,6 +603,12 @@ pub struct ConfigFile {
     #[serde(default)]
     pub imports: SortedMap<ImportName, RemoteImport>,
 
+    /// Top-level policies.
+    #[serde(rename = "root-policy")]
+    #[serde(skip_serializing_if = "RootPolicy::is_empty")]
+    #[serde(default)]
+    pub root_policy: RootPolicy,
+
     /// A table of policies for crates.
     #[serde(skip_serializing_if = "Policy::is_empty")]
     #[serde(default)]
@@ -632,6 +638,33 @@ pub fn get_default_criteria() -> CriteriaName {
 }
 fn is_default_criteria(val: &CriteriaName) -> bool {
     val == DEFAULT_CRITERIA
+}
+
+/// Default policy values which apply to root crates.
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Default)]
+pub struct RootPolicy {
+    /// Default criteria that must be satisfied by all *direct* third-party
+    /// dependencies of root crates which do not specify a different policy.
+    ///
+    /// If not present, this defaults to the default criteria in the audits table.
+    #[serde(default)]
+    #[serde(with = "serialization::string_or_vec_or_none")]
+    pub criteria: Option<Vec<Spanned<CriteriaName>>>,
+
+    /// Same as `criteria`, but for crates that are only used as dev-dependencies.
+    #[serde(rename = "dev-criteria")]
+    #[serde(default)]
+    #[serde(with = "serialization::string_or_vec_or_none")]
+    pub dev_criteria: Option<Vec<Spanned<CriteriaName>>>,
+
+    /// Freeform notes
+    pub notes: Option<String>,
+}
+
+impl RootPolicy {
+    fn is_empty(&self) -> bool {
+        self.criteria.is_none() && self.dev_criteria.is_none() && self.notes.is_none()
+    }
 }
 
 /// The table of crate policies.

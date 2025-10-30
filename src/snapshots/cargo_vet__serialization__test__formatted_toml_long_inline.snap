@@ -6,6 +6,11 @@ expression: formatted
 [cargo-vet]
 version = "1.0"
 
+[root-policy]
+criteria = "short-criteria"
+dev-criteria = "long-criteria"
+notes = "root policy notes go here!"
+
 [policy.long-criteria]
 criteria = "long-criteria"
 notes = "notes go here!"

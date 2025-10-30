@@ -890,6 +890,11 @@ mod test {
                 },
                 default_criteria: get_default_criteria(),
                 imports: SortedMap::new(),
+                root_policy: RootPolicy {
+                    criteria: Some(vec!["short-criteria".to_owned().into()]),
+                    dev_criteria: Some(vec!["long-criteria".to_owned().into()]),
+                    notes: Some("root policy notes go here!".to_owned()),
+                },
                 policy,
                 exemptions: SortedMap::new(),
             },

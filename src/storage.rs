@@ -167,6 +167,7 @@ impl Store {
                 cargo_vet: Default::default(),
                 default_criteria: format::get_default_criteria(),
                 imports: SortedMap::new(),
+                root_policy: Default::default(),
                 policy: Default::default(),
                 exemptions: SortedMap::new(),
             },
