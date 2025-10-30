@@ -20,6 +20,7 @@ use errors::{
 use format::{CriteriaName, CriteriaStr, PackageName, Policy, PolicyEntry, SortedSet, VetVersion};
 use futures_util::future::{join_all, try_join_all};
 use guppy::graph::cargo::CargoResolverVersion;
+use guppy::graph::feature::FeatureId;
 use guppy::graph::{ExternalSource, PackageGraph, PackageMetadata};
 use indicatif::ProgressDrawTarget;
 use lazy_static::lazy_static;
@@ -38,12 +39,14 @@ use tracing::{error, info, trace, warn};
 use crate::cli::*;
 use crate::criteria::CriteriaMapper;
 use crate::errors::{
-    CommandError, DownloadError, FetchAndDiffError, FetchError, MetadataAcquireError, SourceFile,
+    CommandError, DownloadError, FetchAndDiffError, FetchError, MetadataAcquireError,
+    NonWorkspaceExcludedFeatureError, RequiredExcludedFeatureError, SourceFile,
+    UnknownExcludedFeatureError,
 };
 use crate::format::{
     AuditEntry, AuditKind, AuditsFile, ConfigFile, CratesPublisherSource, CratesSourceId,
-    CriteriaEntry, ExemptedDependency, FetchCommand, MetaConfig, MetaConfigInstance, PackageStr,
-    SortedMap, StoreInfo, TrustEntry, WildcardEntry,
+    CriteriaEntry, ExemptedDependency, FeatureName, FeatureStr, FetchCommand, MetaConfig,
+    MetaConfigInstance, PackageStr, SortedMap, StoreInfo, TrustEntry, WildcardEntry,
 };
 use crate::git_tool::Pager;
 use crate::out::{indeterminate_spinner, Out, StderrLogWriter, MULTIPROGRESS};
@@ -3287,6 +3290,8 @@ fn check_crate_policies(cfg: &Config, store: &Store) -> Result<(), CratePolicyEr
         .filter_map(|(name, _, entry)| (!entry.dependency_criteria.is_empty()).then_some(&name[..]))
         .collect::<SortedSet<_>>();
 
+    let mut errors = Vec::new();
+
     let mut needs_policy_version_errors = Vec::new();
 
     for package in cfg.package_graph.packages() {
@@ -3308,7 +3313,13 @@ fn check_crate_policies(cfg: &Config, store: &Store) -> Result<(), CratePolicyEr
         }
     }
 
-    needs_policy_version_errors.sort();
+    if !needs_policy_version_errors.is_empty() {
+        needs_policy_version_errors.sort();
+
+        errors.push(CratePolicyError::NeedsVersion(NeedsPolicyVersionErrors {
+            errors: needs_policy_version_errors,
+        }));
+    }
 
     let unused_policy_version_errors: Vec<_> = policy_crates
         .into_iter()
@@ -3326,20 +3337,90 @@ fn check_crate_policies(cfg: &Config, store: &Store) -> Result<(), CratePolicyEr
         )
         .collect();
 
-    if !needs_policy_version_errors.is_empty() || !unused_policy_version_errors.is_empty() {
-        let mut errors = Vec::new();
-        if !needs_policy_version_errors.is_empty() {
-            errors.push(CratePolicyError::NeedsVersion(NeedsPolicyVersionErrors {
-                errors: needs_policy_version_errors,
-            }));
+    if !unused_policy_version_errors.is_empty() {
+        errors.push(CratePolicyError::UnusedVersion(UnusedPolicyVersionErrors {
+            errors: unused_policy_version_errors,
+        }))
+    }
+
+    for package in cfg.package_graph.packages() {
+        let Some(policy) = store
+            .config
+            .policy
+            .get(package.name(), &package.vet_version())
+        else {
+            continue;
+        };
+        if policy.dev_features.is_empty() {
+            continue;
         }
-        if !unused_policy_version_errors.is_empty() {
-            errors.push(CratePolicyError::UnusedVersion(UnusedPolicyVersionErrors {
-                errors: unused_policy_version_errors,
-            }));
+
+        if !package.in_workspace() {
+            errors.push(CratePolicyError::NonWorkspaceExcludedFeature(
+                NonWorkspaceExcludedFeatureError {
+                    name: package.name().to_string(),
+                    version: package.vet_version(),
+                },
+            ));
+            continue;
         }
-        Err(CratePolicyErrors { errors })
-    } else {
+
+        let excluded: SortedSet<FeatureStr<'_>> =
+            policy.dev_features.iter().map(|s| &s[..]).collect();
+        let features: SortedSet<FeatureStr<'_>> = package.named_features().collect();
+
+        let unknown: SortedSet<FeatureName> = excluded
+            .difference(&features)
+            .map(|s| s.to_string())
+            .collect();
+        if !unknown.is_empty() {
+            errors.push(CratePolicyError::UnknownExcludedFeature(
+                UnknownExcludedFeatureError {
+                    name: package.name().to_string(),
+                    version: package.vet_version(),
+                    features: unknown,
+                },
+            ));
+        }
+
+        // Build a list of every feature in `package` which names each excluded
+        // feature as a direct dependency.
+        let mut implied_features: SortedMap<FeatureName, Vec<FeatureName>> = SortedMap::new();
+        for incl in features.difference(&excluded) {
+            for excl in &excluded {
+                if cfg
+                    .package_graph
+                    .feature_graph()
+                    .directly_depends_on(
+                        FeatureId::named(package.id(), incl),
+                        FeatureId::named(package.id(), excl),
+                    )
+                    .unwrap_or(false)
+                {
+                    implied_features
+                        .entry(excl.to_string())
+                        .or_default()
+                        .push(incl.to_string());
+                }
+            }
+        }
+
+        if !implied_features.is_empty() {
+            errors.push(CratePolicyError::RequiredExcludedFeature(
+                RequiredExcludedFeatureError {
+                    name: package.name().to_string(),
+                    version: package.vet_version(),
+                    features: implied_features,
+                },
+            ));
+        }
+    }
+
+    errors.sort();
+
+    if errors.is_empty() {
         Ok(())
+    } else {
+        Err(CratePolicyErrors { errors })
     }
 }

@@ -139,3 +139,92 @@ fn simple_crate_policies_extraneous_crates() {
         },
     );
 }
+
+#[test]
+fn features_non_workspace_excluded() {
+    let _enter = TEST_RUNTIME.enter();
+
+    CratePolicyTest(MockMetadata::new(vec![
+        MockPackage {
+            name: "root",
+            is_workspace: true,
+            is_first_party: true,
+            deps: vec![MockDependency {
+                name: "third-party",
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        MockPackage {
+            name: "third-party",
+            features: BTreeMap::from([("unknown-feature", vec![])]),
+            ..Default::default()
+        },
+    ]))
+    .insta_crate_policy_errors("features-non-workspace-excluded", |config| {
+        config.policy.insert(
+            "third-party".into(),
+            PackagePolicyEntry::Unversioned(PolicyEntry {
+                dev_features: vec!["unknown-feature".to_string()],
+                ..Default::default()
+            }),
+        );
+    });
+}
+
+#[test]
+fn features_excluded_unknown() {
+    let _enter = TEST_RUNTIME.enter();
+
+    CratePolicyTest(MockMetadata::new(vec![MockPackage {
+        name: "root",
+        is_workspace: true,
+        is_first_party: true,
+        features: BTreeMap::from([("known-feature", vec![])]),
+        ..Default::default()
+    }]))
+    .insta_crate_policy_errors("features-excluded-unknown", |config| {
+        config.policy.insert(
+            "root".into(),
+            PackagePolicyEntry::Unversioned(PolicyEntry {
+                dev_features: vec!["known-feature".to_string(), "unknown-feature".to_string()],
+                ..Default::default()
+            }),
+        );
+    });
+}
+
+#[test]
+fn features_excluded_implied_fail() {
+    // FAIL: Errors because the implicit `third-party` feature is implied by the
+    // non-excluded `feat` feature.
+    let _enter = TEST_RUNTIME.enter();
+
+    CratePolicyTest(MockMetadata::new(vec![
+        MockPackage {
+            name: "root",
+            is_workspace: true,
+            is_first_party: true,
+            features: BTreeMap::from([("feat", vec!["third-party"]), ("feat2", vec!["feat"])]),
+            deps: vec![MockDependency {
+                name: "third-party",
+                optional: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        MockPackage {
+            name: "third-party",
+            ..Default::default()
+        },
+    ]))
+    .insta_crate_policy_errors("features-excluded-implied-fail", |config| {
+        config.policy.insert(
+            "root".into(),
+            PackagePolicyEntry::Unversioned(PolicyEntry {
+                dev_features: vec!["third-party".to_string()],
+                ..Default::default()
+            }),
+        );
+    });
+}

@@ -285,6 +285,40 @@ pub mod policy {
     }
 }
 
+/// Wrapper for `target_spec::Triple` which makes the type implement various
+/// important traits, including `Serialize`, and `Deserialize`.
+#[derive(Eq, PartialEq, Ord, PartialOrd, Debug, Clone)]
+pub struct SerdeTriple {
+    pub triple: target_spec::Triple,
+}
+
+impl Serialize for SerdeTriple {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.triple.as_str().serialize(serializer)
+    }
+    }
+
+impl<'de> Deserialize<'de> for SerdeTriple {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let triple = target_spec::Triple::new_strict(s).map_err(de::Error::custom)?;
+        Ok(SerdeTriple { triple })
+    }
+}
+
+impl std::str::FromStr for SerdeTriple {
+    type Err = target_spec::errors::TripleParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(SerdeTriple { triple: s.parse()? })
+    }
+}
+
 pub mod audit {
     use super::*;
 
@@ -869,6 +903,7 @@ mod test {
                 criteria: Some(vec!["long-criteria".to_owned().into()]),
                 dev_criteria: None,
                 dependency_criteria: dc_long,
+                dev_features: vec![],
                 notes: Some("notes go here!".to_owned()),
             }),
         );
@@ -879,6 +914,7 @@ mod test {
                 criteria: Some(vec!["short-criteria".to_owned().into()]),
                 dev_criteria: None,
                 dependency_criteria: dc_short,
+                dev_features: vec!["dev-feature".to_owned()],
                 notes: Some("notes go here!".to_owned()),
             }),
         );
@@ -893,6 +929,7 @@ mod test {
                 root_policy: RootPolicy {
                     criteria: Some(vec!["short-criteria".to_owned().into()]),
                     dev_criteria: Some(vec!["long-criteria".to_owned().into()]),
+                    build_targets: Some(vec!["x86_64-pc-windows-msvc".parse().unwrap()]),
                     notes: Some("root policy notes go here!".to_owned()),
                 },
                 policy,

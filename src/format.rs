@@ -3,7 +3,7 @@
 use crate::cli::FetchMode;
 use crate::errors::{StoreVersionParseError, VersionParseError};
 use crate::resolver::{DiffRecommendation, ViolationConflict};
-use crate::serialization::{spanned::Spanned, CacheFileVersion, Tidyable};
+use crate::serialization::{spanned::Spanned, CacheFileVersion, SerdeTriple, Tidyable};
 use crate::{flock::Filesystem, serialization};
 use core::{cmp, fmt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -27,6 +27,8 @@ pub type PackageName = String;
 pub type PackageStr<'a> = &'a str;
 pub type ImportName = String;
 pub type ImportStr<'a> = &'a str;
+pub type FeatureName = String;
+pub type FeatureStr<'a> = &'a str;
 pub type CratesUserId = u64;
 pub type CratesTrustpubSignature = String;
 
@@ -657,13 +659,23 @@ pub struct RootPolicy {
     #[serde(with = "serialization::string_or_vec_or_none")]
     pub dev_criteria: Option<Vec<Spanned<CriteriaName>>>,
 
+    /// If specified, the set of platforms which workspace crates will be built on.
+    ///
+    /// NOTE: This is currently only available on the root policy, and not
+    /// crate-specific policies, due to how build simulations are currently run.
+    #[serde(rename = "build-targets")]
+    pub build_targets: Option<Vec<SerdeTriple>>,
+
     /// Freeform notes
     pub notes: Option<String>,
 }
 
 impl RootPolicy {
     fn is_empty(&self) -> bool {
-        self.criteria.is_none() && self.dev_criteria.is_none() && self.notes.is_none()
+        self.criteria.is_none()
+            && self.dev_criteria.is_none()
+            && self.build_targets.is_none()
+            && self.notes.is_none()
     }
 }
 
@@ -879,6 +891,24 @@ pub struct PolicyEntry {
     #[serde(with = "serialization::criteria_map")]
     #[serde(default)]
     pub dependency_criteria: CriteriaMap,
+
+    /// Exclude a set of features when simulating a non-dev build of this crate
+    /// as a root crate. This policy is only valid for crates in the workspace.
+    ///
+    /// By default, all named features are enabled (as-if `--all-features` was
+    /// passed). If a feature is listed here, it will not be explicitly enabled,
+    /// (although features implied by a listed feature may be enabled).
+    ///
+    /// This approach (of explicitly excluding features, rather than including
+    /// them) is taken to ensure that newly added features in root crates are
+    /// not missed when auditing.
+    ///
+    /// An error will be emitted during `cargo vet` if an excluded feature is
+    /// unconditionally required by a non-excluded feature.
+    #[serde(rename = "dev-features")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub dev_features: Vec<FeatureName>,
 
     /// Freeform notes
     pub notes: Option<String>,

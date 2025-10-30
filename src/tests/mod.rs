@@ -8,15 +8,15 @@ use std::{
 };
 
 use clap::Parser;
-use guppy::graph::{cargo::CargoResolverVersion, DependencyDirection, PackageGraph};
+use guppy::graph::{cargo::CargoResolverVersion, PackageGraph};
 use serde_json::{json, Value};
 
 use crate::{
     format::{
         AuditEntry, AuditKind, AuditsFile, ConfigFile, CratesAPICrate, CratesAPICrateMetadata,
         CratesAPITrustpubData, CratesAPIUser, CratesAPIVersion, CratesPublisher, CratesSourceId,
-        CratesUserId, CriteriaEntry, CriteriaMap, CriteriaName, CriteriaStr, ExemptedDependency,
-        FastMap, ImportsFile, MetaConfig, PackageName, PackagePolicyEntry, PackageStr, PolicyEntry,
+        CratesUserId, CriteriaEntry, CriteriaName, CriteriaStr, ExemptedDependency, FastMap,
+        ImportsFile, MetaConfig, PackageName, PackagePolicyEntry, PackageStr, PolicyEntry,
         SortedMap, SortedSet, TrustEntry, VersionReq, VetVersion, WildcardEntry, SAFE_TO_DEPLOY,
         SAFE_TO_RUN,
     },
@@ -389,6 +389,7 @@ fn default_policy() -> PolicyEntry {
         criteria: None,
         dev_criteria: None,
         dependency_criteria: SortedMap::new(),
+        dev_features: vec![],
         notes: None,
     }
 }

@@ -1,0 +1,10 @@
+---
+source: src/tests/crate_policies.rs
+expression: "format!(\"{:?}\", miette::Report::new(e))"
+---
+  × There are some issues with your policy entries
+
+Error:   × Excluded features for root:10.0.0 are required by non-excluded features
+  │   third-party (required by feat)
+  help: Also add these features to `exclude-features`
+

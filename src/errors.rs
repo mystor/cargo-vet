@@ -12,10 +12,12 @@ use thiserror::Error;
 
 use crate::{
     format::{
-        CriteriaName, ForeignCriteriaName, ImportName, PackageName, StoreVersion, VetVersion,
+        CriteriaName, FeatureName, ForeignCriteriaName, ImportName, PackageName, SortedMap,
+        SortedSet, StoreVersion, VetVersion,
     },
     network::PayloadEncoding,
     serialization::spanned::Spanned,
+    string_format,
 };
 
 #[derive(Eq, PartialEq)]
@@ -217,15 +219,16 @@ pub struct PackageError {
 ///////////////////////////////////////////////////////////
 // CratePolicyErrors
 ///////////////////////////////////////////////////////////
+
 #[derive(Debug, Error, Diagnostic, PartialEq, Eq)]
-#[error("There are some issues with your third-party policy entries")]
+#[error("There are some issues with your policy entries")]
 #[diagnostic()]
 pub struct CratePolicyErrors {
     #[related]
     pub errors: Vec<CratePolicyError>,
 }
 
-#[derive(Debug, Error, Diagnostic, PartialEq, Eq)]
+#[derive(Debug, Error, Diagnostic, PartialEq, Eq, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum CratePolicyError {
     #[error(transparent)]
@@ -234,9 +237,18 @@ pub enum CratePolicyError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     UnusedVersion(UnusedPolicyVersionErrors),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    NonWorkspaceExcludedFeature(NonWorkspaceExcludedFeatureError),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    UnknownExcludedFeature(UnknownExcludedFeatureError),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    RequiredExcludedFeature(RequiredExcludedFeatureError),
 }
 
-#[derive(Debug, Error, Diagnostic, PartialEq, Eq)]
+#[derive(Debug, Error, Diagnostic, PartialEq, Eq, PartialOrd, Ord)]
 #[diagnostic(help(
     "Specifing `dependency-criteria` requires explicit policies for each version of \
      a crate. Add a `policy.\"<crate>:<version>\"` entry for them."
@@ -255,7 +267,7 @@ impl Display for NeedsPolicyVersionErrors {
     }
 }
 
-#[derive(Debug, Error, Diagnostic, PartialEq, Eq)]
+#[derive(Debug, Error, Diagnostic, PartialEq, Eq, PartialOrd, Ord)]
 #[diagnostic(help("Remove the `policy` entries"))]
 pub struct UnusedPolicyVersionErrors {
     pub errors: Vec<PackageError>,
@@ -266,6 +278,60 @@ impl Display for UnusedPolicyVersionErrors {
         f.write_str("some versioned policy entries don't correspond to crates being used")?;
         for e in &self.errors {
             f.write_fmt(format_args!("\n  {e}"))?
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error, Diagnostic, PartialEq, Eq, PartialOrd, Ord)]
+#[error("Policy entry for non-workspace {name}:{version} excludes features")]
+#[diagnostic(help("Policy `exclude-features` is only valid for workspace crates"))]
+pub struct NonWorkspaceExcludedFeatureError {
+    pub name: PackageName,
+    pub version: VetVersion,
+}
+
+#[derive(Debug, Error, Diagnostic, PartialEq, Eq, PartialOrd, Ord)]
+#[diagnostic(help("Remove the features from `exclude-features`"))]
+pub struct UnknownExcludedFeatureError {
+    pub name: PackageName,
+    pub version: VetVersion,
+    pub features: SortedSet<FeatureName>,
+}
+
+impl Display for UnknownExcludedFeatureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "Unknown excluded features for {}:{}",
+            self.name, self.version
+        ))?;
+        for feat in &self.features {
+            f.write_fmt(format_args!("\n  {feat}"))?
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error, Diagnostic, PartialEq, Eq, PartialOrd, Ord)]
+#[diagnostic(help("Also add these features to `exclude-features`"))]
+pub struct RequiredExcludedFeatureError {
+    pub name: PackageName,
+    pub version: VetVersion,
+    pub features: SortedMap<FeatureName, Vec<FeatureName>>,
+}
+
+impl Display for RequiredExcludedFeatureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "Excluded features for {}:{} are required by non-excluded features",
+            self.name, self.version
+        ))?;
+        for (feat, required_by) in &self.features {
+            f.write_fmt(format_args!(
+                "\n  {} (required by {})",
+                feat,
+                string_format::FormatShortList::new(required_by.clone())
+            ))?
         }
         Ok(())
     }

@@ -4,7 +4,7 @@ expression: "format!(\"{:?}\", miette::Report::new(e))"
 ---
   × There are some issues with your policy entries
 
-Error:   × some versioned policy entries don't correspond to crates being used
-  │   third-party:3.0.0
-  help: Remove the `policy` entries
+Error:   × Unknown excluded features for root:10.0.0
+  │   unknown-feature
+  help: Remove the features from `exclude-features`
 

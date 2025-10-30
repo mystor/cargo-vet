@@ -9,6 +9,7 @@ version = "1.0"
 [root-policy]
 criteria = "short-criteria"
 dev-criteria = "long-criteria"
+build-targets = ["x86_64-pc-windows-msvc"]
 notes = "root policy notes go here!"
 
 [policy.long-criteria]
@@ -27,5 +28,6 @@ example-crate-3 = [
 [policy.short-criteria]
 criteria = "short-criteria"
 dependency-criteria = { example-crate-1 = "criteria-one" }
+dev-features = ["dev-feature"]
 notes = "notes go here!"
 

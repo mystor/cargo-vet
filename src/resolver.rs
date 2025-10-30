@@ -54,9 +54,11 @@
 
 use futures_util::future::join_all;
 use guppy::graph::cargo::{BuildPlatform, CargoOptions, CargoResolverVersion};
-use guppy::graph::feature::{FeatureLabel, FeatureSet, StandardFeatures};
+use guppy::graph::feature::{
+    FeatureFilter, FeatureGraph, FeatureId, FeatureLabel, FeatureSet, StandardFeatures,
+};
 use guppy::graph::{DependencyDirection, PackageGraph, PackageLink, PackageMetadata};
-use guppy::platform::{EnabledTernary, PlatformSpec};
+use guppy::platform::{EnabledTernary, Platform, PlatformSpec, TargetFeatures};
 use guppy::{DependencyKind, PackageId};
 use miette::IntoDiagnostic;
 use serde::{Deserialize, Serialize};
@@ -64,13 +66,14 @@ use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{hash_map, BinaryHeap};
 use std::sync::Arc;
+use target_spec::TargetSpec;
 use tracing::{debug, debug_span, trace, trace_span, warn};
 
 use crate::cli::OutputFormat;
 use crate::criteria::{CriteriaMapper, CriteriaSet};
 use crate::errors::SuggestError;
 use crate::format::{
-    self, AuditEntry, AuditKind, AuditsFile, CratesPublisher, CratesPublisherSource,
+    self, AuditEntry, AuditKind, AuditsFile, ConfigFile, CratesPublisher, CratesPublisherSource,
     CratesSourceId, CriteriaName, Delta, DiffStat, ExemptedDependency, FastMap, FastSet,
     ImportName, ImportsFile, JsonPackage, JsonReport, JsonReportConclusion, JsonReportFailForVet,
     JsonReportFailForViolationConflict, JsonReportSuccess, JsonSuggest, JsonSuggestItem,
@@ -79,6 +82,7 @@ use crate::format::{
 use crate::format::{SortedMap, SortedSet};
 use crate::network::Network;
 use crate::out::{progress_bar, IncProgressOnDrop, Out};
+use crate::serialization::SerdeTriple;
 use crate::storage::Cache;
 use crate::string_format::FormatShortList;
 use crate::{Config, PackageExt, Store};
@@ -600,6 +604,53 @@ fn resolve_requirements_for_build<'g>(
     }
 }
 
+/// `guppy::FeatureFilter` implementation which looks up feature specifications
+/// based on the policy.
+struct PolicyFeatures<'a>(&'a Policy);
+
+impl<'a, 'g: 'a> FeatureFilter<'g> for PolicyFeatures<'a> {
+    fn accept(&mut self, graph: &FeatureGraph<'g>, feature_id: FeatureId<'g>) -> bool {
+        match feature_id.label() {
+            // Always enable the base feature.
+            FeatureLabel::Base => true,
+            // We only enable optional dependencies if there is an edge from an
+            // enabled feature to it (as optional dependency features cannot be
+            // explicitly enabled).
+            FeatureLabel::OptionalDependency(_) => false,
+            // We enable named features unless they're listed in `exclude_features`.
+            FeatureLabel::Named(name) => {
+                let package = graph
+                    .package_graph()
+                    .metadata(feature_id.package_id())
+                    .expect("package ID must be valid");
+                let to_exclude = package
+                    .policy_entry(self.0)
+                    .map(|policy| &policy.dev_features[..])
+                    .unwrap_or(&[]);
+                to_exclude.iter().all(|excluded| excluded != name)
+            }
+        }
+    }
+}
+
+/// Convert build target triples (as specified in the config file) to a list of
+/// `PlatformSpec`s which can be used to perform individual simulated builds.
+fn build_targets_to_platform_specs(build_targets: &Option<Vec<SerdeTriple>>) -> Vec<PlatformSpec> {
+    let Some(triples) = build_targets else {
+        return vec![PlatformSpec::Any];
+    };
+
+    triples
+        .iter()
+        .map(|triple| {
+            PlatformSpec::from(Platform::from_triple(
+                triple.triple.clone(),
+                TargetFeatures::Unknown,
+            ))
+        })
+        .collect()
+}
+
 fn resolve_requirements<'g>(
     package_graph: &'g PackageGraph,
     config_file: &ConfigFile,
@@ -608,42 +659,47 @@ fn resolve_requirements<'g>(
 ) -> FastMap<&'g PackageId, CriteriaSet> {
     let _resolve_requirements = trace_span!("resolve_requirements").entered();
 
-    // FIXME: Allow the user to customize a subset of platforms to be interested
-    // in, and check each independently.
-    let platform_spec = PlatformSpec::Any;
-
     let mut requirements = FastMap::<&'g PackageId, CriteriaSet>::new();
 
     let workspace_set = package_graph.resolve_workspace();
 
-    // First-pass: Simulate a build for the entire workspace at once, with
-    // dev-dependencies enabled. Dependencies built this way will use dev
-    // criteria, respecting config options.
-    debug!("simulating --workspace dev build (dev_pass)");
-    resolve_requirements_for_build(
-            config_file,
-        criteria_mapper,
-        workspace_set.to_feature_set(StandardFeatures::All),
-        &platform_spec,
-        resolver_version,
-        /* dev_pass */ true,
-        &mut requirements,
-    );
+    // NOTE: Currently we only support build targets on root_policy, but
+    // theoretically it might be possible to do per-root build targets if
+    // there's a need for it by simulating each separately.
+    let platform_specs = build_targets_to_platform_specs(&config_file.root_policy.build_targets);
 
-    // Second-pass: Simulate a build of each root package independently, with
-    // dev-dependencies disabled. Dependencies built this way will use standard
-    // criteria, respecting config options.
-    for root in workspace_set.root_packages(DependencyDirection::Forward) {
-        debug!("simulating target build of root package: {}", root.id());
+    for platform_spec in platform_specs {
+        let _per_platform = debug_span!("resolving requirements for platform", ?platform_spec);
+
+        // First-pass: Simulate a build for the entire workspace at once, with
+        // dev-dependencies enabled. Dependencies built this way will use dev
+        // criteria and enable all features, respecting config options.
+        debug!("simulating --workspace dev build (dev_pass)");
         resolve_requirements_for_build(
-                config_file,
+            config_file,
             criteria_mapper,
-            root.to_feature_set(StandardFeatures::All),
+            workspace_set.to_feature_set(StandardFeatures::All),
             &platform_spec,
             resolver_version,
-            /* dev_pass */ false,
+            /* dev_pass */ true,
             &mut requirements,
         );
+
+        // Second-pass: Simulate a build of each workspace package
+        // independently, with dev-dependencies disabled. Dependencies built
+        // this way will use standard criteria, respecting config options.
+        for root in workspace_set.packages(DependencyDirection::Forward) {
+            debug!("simulating target build of package: {}", root.id());
+            resolve_requirements_for_build(
+                config_file,
+                criteria_mapper,
+                root.to_feature_set(PolicyFeatures(&config_file.policy)),
+                &platform_spec,
+                resolver_version,
+                /* dev_pass */ false,
+                &mut requirements,
+            );
+        }
     }
 
     requirements
