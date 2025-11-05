@@ -1,0 +1,6 @@
+---
+source: src/tests/vet.rs
+expression: human
+---
+Vetting Succeeded (1 fully audited)
+

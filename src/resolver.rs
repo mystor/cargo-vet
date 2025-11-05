@@ -449,6 +449,7 @@ fn is_link_enabled(
 
 /// Package-specific auditing requirements, including both the set of features
 /// enabled for the package, as well as the criteria enabled for the package.
+#[derive(Clone, Debug)]
 pub struct RequirementsSpec<'g> {
     pub criteria: CriteriaSet,
     pub features: SortedSet<FeatureStr<'g>>,
@@ -792,7 +793,7 @@ fn resolve_audits<'g>(
             store,
             criteria_mapper,
             package.name(),
-            &default_reqs.features,
+            &required.features,
             None,
         ) {
             Ok(audit_graph) => audit_graph,

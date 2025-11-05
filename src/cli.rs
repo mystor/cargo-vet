@@ -2,9 +2,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
+use target_spec::TargetSpec;
 use tracing::level_filters::LevelFilter;
 
-use crate::format::{CriteriaName, ImportName, PackageName, VersionReq, VetVersion};
+use crate::format::{CriteriaName, FeatureName, ImportName, PackageName, VersionReq, VetVersion};
 
 #[derive(Parser)]
 #[clap(version, about, long_about = None)]
@@ -475,6 +476,18 @@ pub struct CertifyArgs {
     /// Accept all criteria without an interactive prompt
     #[clap(long, action)]
     pub accept_all: bool,
+    /// Features to exclude from the audit
+    ///
+    /// For example, if a crate has features "a" and "b", and you only
+    /// audit the code enabled by feature "a", you would pass --exclude-features=b
+    #[clap(long, action)]
+    pub exclude_features: Vec<FeatureName>,
+    /// Targets to exclude from the audit
+    ///
+    /// For example, if you only audit the code compiled for your primary target
+    /// platform, you would exclude other platforms.
+    #[clap(long, action)]
+    pub exclude_targets: Vec<TargetSpec>,
     /// Force the command to ignore whether the package/version makes sense
     ///
     /// To catch typos/mistakes, we check if the thing you're trying to

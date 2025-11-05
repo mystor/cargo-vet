@@ -364,6 +364,11 @@ pub enum CertifyError {
     #[error("couldn't build an audit graph to determine audit collapse validity")]
     #[diagnostic(help("use --no-collapse to disable audit collapsing"))]
     BadAuditGraph,
+    #[error("cannot apply feature or target restrictions to wildcard audits")]
+    BadRestrictedWildcard,
+    #[error("'{0}' does not have a feature named '{1}'")]
+    #[diagnostic(help("use --force to ignore this error"))]
+    UnknownExcludedFeatures(PackageName, FeatureName),
     #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error(transparent)]

@@ -322,6 +322,16 @@ If not provided, will be 1 year from the current date.
 #### `--accept-all`
 Accept all criteria without an interactive prompt
 
+#### `--exclude-features <EXCLUDE_FEATURES>`
+Features to exclude from the audit
+
+For example, if a crate has features "a" and "b", and you only audit the code enabled by feature "a", you would pass --exclude-features=b
+
+#### `--exclude-targets <EXCLUDE_TARGETS>`
+Targets to exclude from the audit
+
+For example, if you only audit the code compiled for your primary target platform, you would exclude other platforms.
+
 #### `--force`
 Force the command to ignore whether the package/version makes sense
 

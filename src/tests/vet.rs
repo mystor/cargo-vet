@@ -1,4 +1,7 @@
-use crate::format::{RegistryEntry, RegistryFile};
+use crate::{
+    format::{RegistryEntry, RegistryFile},
+    serialization::{SerdeTargetSpec, SerdeTriple},
+};
 
 use super::*;
 
@@ -2657,4 +2660,146 @@ fn feature_tree_no_exemptions() {
     let store = Store::mock(config, audits, imports);
 
     assert_report_snapshot!("feature-tree-no-exemptions", metadata, store);
+}
+
+#[test]
+fn exclude_feature_unused() {
+    // (Pass) The feature being unused should allow the audit to succeed
+
+    let _enter = TEST_RUNTIME.enter();
+    let mock = MockMetadata::new(vec![
+        MockPackage {
+            name: "root",
+            is_workspace: true,
+            is_first_party: true,
+            deps: vec![MockDependency {
+                name: "third-party",
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        MockPackage {
+            name: "third-party",
+            features: [("unused_feature", vec![])].into(),
+            ..Default::default()
+        },
+    ]);
+
+    let metadata = mock.metadata();
+    let (config, mut audits, imports) = builtin_files_no_exemptions(&metadata);
+
+    audits.audits.insert(
+        "third-party".to_owned(),
+        vec![AuditEntry {
+            exclude_features: vec!["unused_feature".to_owned()],
+            ..full_audit(ver(DEFAULT_VER), SAFE_TO_DEPLOY)
+        }],
+    );
+
+    let store = Store::mock(config, audits, imports);
+
+    assert_report_snapshot!("exclude-feature-unused", metadata, store);
+}
+
+#[test]
+fn exclude_feature_used() {
+    // (Fail) The feature being used should lead to an audit failure
+
+    let _enter = TEST_RUNTIME.enter();
+    let mock = MockMetadata::new(vec![
+        MockPackage {
+            name: "root",
+            is_workspace: true,
+            is_first_party: true,
+            deps: vec![MockDependency {
+                name: "third-party",
+                features: vec!["used_feature"],
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        MockPackage {
+            name: "third-party",
+            features: [("used_feature", vec![])].into(),
+            ..Default::default()
+        },
+    ]);
+
+    let metadata = mock.metadata();
+    let (config, mut audits, imports) = builtin_files_no_exemptions(&metadata);
+
+    audits.audits.insert(
+        "third-party".to_owned(),
+        vec![AuditEntry {
+            exclude_features: vec!["used_feature".to_owned()],
+            ..full_audit(ver(DEFAULT_VER), SAFE_TO_DEPLOY)
+        }],
+    );
+
+    let store = Store::mock(config, audits, imports);
+
+    assert_report_snapshot!("exclude-feature-used", metadata, store);
+}
+
+#[test]
+fn exclude_target_unused() {
+    // (Pass) The platform not being used should not lead to an audit failure
+
+    let _enter = TEST_RUNTIME.enter();
+    let mock = MockMetadata::simple();
+
+    let metadata = mock.metadata();
+    let (mut config, mut audits, imports) = builtin_files_full_audited(&metadata);
+
+    config.root_policy.build_targets = Some(vec![SerdeTriple {
+        triple: "x86_64-linux-unknown".parse().unwrap(),
+    }]);
+
+    audits.audits.insert(
+        "third-party1".to_owned(),
+        vec![AuditEntry {
+            exclude_targets: vec![SerdeTargetSpec {
+                target_spec: "cfg(windows)".parse().unwrap(),
+            }],
+            ..full_audit(ver(DEFAULT_VER), SAFE_TO_DEPLOY)
+        }],
+    );
+
+    let store = Store::mock(config, audits, imports);
+
+    assert_report_snapshot!("exclude-target-unused", metadata, store);
+}
+
+#[test]
+fn exclude_target_used() {
+    // (Fail) The platform being used should lead to an audit failure
+
+    let _enter = TEST_RUNTIME.enter();
+    let mock = MockMetadata::simple();
+
+    let metadata = mock.metadata();
+    let (mut config, mut audits, imports) = builtin_files_full_audited(&metadata);
+
+    config.root_policy.build_targets = Some(vec![
+        SerdeTriple {
+            triple: "x86_64-linux-unknown".parse().unwrap(),
+        },
+        SerdeTriple {
+            triple: "x86_64-pc-windows-msvc".parse().unwrap(),
+        },
+    ]);
+
+    audits.audits.insert(
+        "third-party1".to_owned(),
+        vec![AuditEntry {
+            exclude_targets: vec![SerdeTargetSpec {
+                target_spec: "cfg(windows)".parse().unwrap(),
+            }],
+            ..full_audit(ver(DEFAULT_VER), SAFE_TO_DEPLOY)
+        }],
+    );
+
+    let store = Store::mock(config, audits, imports);
+
+    assert_report_snapshot!("exclude-target-used", metadata, store);
 }

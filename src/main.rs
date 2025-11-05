@@ -30,8 +30,8 @@ use out::{progress_bar, IncProgressOnDrop};
 use reqwest::Url;
 use resolver::AuditGraph;
 use serde::de::Deserialize;
-use serialization::spanned::Spanned;
 use serialization::Tidyable;
+use serialization::{spanned::Spanned, SerdeTargetSpec};
 use storage::fetch_registry;
 use thiserror::Error;
 use tracing::{error, info, trace, warn};
@@ -45,7 +45,7 @@ use crate::errors::{
 };
 use crate::format::{
     AuditEntry, AuditKind, AuditsFile, ConfigFile, CratesPublisherSource, CratesSourceId,
-    CriteriaEntry, ExemptedDependency, FeatureName, FeatureStr, FetchCommand, MetaConfig,
+    CriteriaEntry, ExemptedDependency, FastSet, FeatureName, FeatureStr, FetchCommand, MetaConfig,
     MetaConfigInstance, PackageStr, SortedMap, StoreInfo, TrustEntry, WildcardEntry,
 };
 use crate::git_tool::Pager;
@@ -712,10 +712,15 @@ fn do_cmd_certify(
         return Err(CertifyError::CouldntGuessPackage);
     };
 
+    let package_set = cfg
+        .package_graph
+        .resolve_package_name(&package)
+        .filter(DependencyDirection::Forward, |pkg| {
+            pkg.is_third_party(&store.config.policy)
+        });
+
     // FIXME: can/should we check if the version makes sense..?
-    if !sub_args.force
-        && !foreign_packages(&cfg.package_graph, &store.config).any(|pkg| *pkg.name() == *package)
-    {
+    if !sub_args.force && package_set.is_empty() {
         return Err(CertifyError::NotAPackage(package));
     }
 
@@ -737,6 +742,10 @@ fn do_cmd_certify(
     }
 
     let kind = if let Some(identifier) = &sub_args.wildcard {
+        if !sub_args.exclude_features.is_empty() || !sub_args.exclude_targets.is_empty() {
+            return Err(CertifyError::BadRestrictedWildcard);
+        }
+
         // Fetch publisher information for relevant versions of `package`.
         let publishers = store.ensure_publisher_versions(cfg, network, &package)?;
         let published_versions = publishers
@@ -807,6 +816,41 @@ fn do_cmd_certify(
                 .collect(),
         )
     };
+
+    let exclude_targets: Vec<_> = sub_args
+        .exclude_targets
+        .iter()
+        .map(|target_spec| SerdeTargetSpec {
+            target_spec: target_spec.clone(),
+        })
+        .collect();
+
+    if !sub_args.force {
+        let version_matched_packages =
+            package_set.filter(DependencyDirection::Forward, |pkg| match &kind {
+                // NOTE: This intentionally ignores the git rev portion.
+                CertifyKind::Full { version } => version.semver == *pkg.version(),
+                CertifyKind::Delta { to, .. } => to.semver == *pkg.version(),
+                CertifyKind::Wildcard { .. } => true,
+            });
+        let cmp_packages = if version_matched_packages.is_empty() {
+            &package_set
+        } else {
+            &version_matched_packages
+        };
+        let known_features: FastSet<_> = cmp_packages
+            .packages(DependencyDirection::Forward)
+            .flat_map(|pkg| pkg.named_features())
+            .collect();
+        for feature in &sub_args.exclude_features {
+            if !known_features.contains(&feature[..]) {
+                return Err(CertifyError::UnknownExcludedFeatures(
+                    package,
+                    feature.clone(),
+                ));
+            }
+        }
+    }
 
     let (criteria_guess, prompt) = if sub_args.criteria.is_empty() {
         // If we don't have explicit cli criteria, guess the criteria
@@ -950,8 +994,8 @@ fn do_cmd_certify(
                     kind,
                     criteria,
                     who,
-                    exclude_targets: vec![],
-                    exclude_features: vec![],
+                    exclude_targets,
+                    exclude_features: sub_args.exclude_features.clone(),
                     importable,
                     notes,
                     aggregated_from: vec![],
@@ -967,8 +1011,8 @@ fn do_cmd_certify(
                 kind,
                 criteria,
                 who,
-                exclude_targets: vec![],
-                exclude_features: vec![],
+                exclude_targets,
+                exclude_features: sub_args.exclude_features.clone(),
                 importable,
                 notes,
                 aggregated_from: vec![],
