@@ -21,7 +21,7 @@ use format::{CriteriaName, CriteriaStr, PackageName, Policy, PolicyEntry, Sorted
 use futures_util::future::{join_all, try_join_all};
 use guppy::graph::cargo::CargoResolverVersion;
 use guppy::graph::feature::FeatureId;
-use guppy::graph::{ExternalSource, PackageGraph, PackageMetadata};
+use guppy::graph::{DependencyDirection, ExternalSource, PackageGraph, PackageMetadata};
 use indicatif::ProgressDrawTarget;
 use lazy_static::lazy_static;
 use miette::{miette, Context, Diagnostic, IntoDiagnostic};
@@ -950,6 +950,8 @@ fn do_cmd_certify(
                     kind,
                     criteria,
                     who,
+                    exclude_targets: vec![],
+                    exclude_features: vec![],
                     importable,
                     notes,
                     aggregated_from: vec![],
@@ -965,6 +967,8 @@ fn do_cmd_certify(
                 kind,
                 criteria,
                 who,
+                exclude_targets: vec![],
+                exclude_features: vec![],
                 importable,
                 notes,
                 aggregated_from: vec![],
@@ -985,7 +989,11 @@ fn do_cmd_certify(
                     // If the audit graph fails to load, we always return `false` and thus don't
                     // make any changes.
                     let audit_graph = match resolver::AuditGraph::build(
-                        store, &mapper, &package, None,
+                        store,
+                        &mapper,
+                        &package,
+                        &SortedSet::new(),
+                        None,
                     ) {
                         Ok(graph) => Some(graph),
                         Err(_) => {
@@ -1655,6 +1663,8 @@ fn cmd_record_violation(
         kind,
         criteria,
         who,
+        exclude_targets: vec![],
+        exclude_features: vec![],
         importable: true,
         notes,
         aggregated_from: vec![],
@@ -2644,17 +2654,35 @@ fn explain_write_edge(
         }
     }
 
+    fn format_exclude_features(exclude_features: &[FeatureName]) -> String {
+        if exclude_features.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (excluded features: {})",
+                string_format::FormatShortList::new(exclude_features.to_owned())
+            )
+        }
+    }
+
     use resolver::DeltaEdgeOrigin::*;
     match *edge {
         StoredLocalAudit { audit_index, .. } => {
             let audit = &store.audits.audits[package][audit_index];
             let who = format_who(&audit.who);
+            let exclude_features = format_exclude_features(&audit.exclude_features);
             match &audit.kind {
                 AuditKind::Full { version } => {
-                    writeln!(out, "{idx}) [local] full audit for {version} by {who}");
+                    writeln!(
+                        out,
+                        "{idx}) [local] full audit for {version} by {who}{exclude_features}"
+                    );
                 }
                 AuditKind::Delta { from, to } => {
-                    writeln!(out, "{idx}) [local] delta audit for {from}->{to} by {who}");
+                    writeln!(
+                        out,
+                        "{idx}) [local] delta audit for {from}->{to} by {who}{exclude_features}"
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -2668,17 +2696,18 @@ fn explain_write_edge(
             let audit = &audits_file.audits[package][audit_index];
             let freshness = format_freshness(audit.is_fresh_import);
             let who = format_who(&audit.who);
+            let exclude_features = format_exclude_features(&audit.exclude_features);
             match &audit.kind {
                 AuditKind::Full { version } => {
                     writeln!(
                         out,
-                        "{idx}) [{import_name}{freshness}] full audit for {version} by {who}"
+                        "{idx}) [{import_name}{freshness}] full audit for {version} by {who}{exclude_features}"
                     );
                 }
                 AuditKind::Delta { from, to } => {
                     writeln!(
                         out,
-                        "{idx}) [{import_name}{freshness}] delta audit for {from}->{to} by {who}"
+                        "{idx}) [{import_name}{freshness}] delta audit for {from}->{to} by {who}{exclude_features}"
                     );
                 }
                 _ => unreachable!(),
@@ -2743,13 +2772,58 @@ fn explain_write_edge(
 
 fn do_cmd_explain_audit(
     out: &Arc<dyn Out>,
+    cfg: &Config,
     store: &Store,
     package: PackageStr<'_>,
     version: &VetVersion,
     criteria_name: CriteriaStr<'_>,
 ) -> Result<(), miette::Report> {
     let criteria_mapper = CriteriaMapper::new(&store.audits.criteria);
-    let audit_graph = AuditGraph::build(store, &criteria_mapper, package, None)
+
+    // Attempt to figure out what features we expect to be enabled.
+    let features = {
+        // Collect all packages which might match.
+        let matching = cfg
+            .package_graph
+            .resolve_package_name(package)
+            .filter(DependencyDirection::Forward, |pkg| {
+                pkg.is_third_party(&store.config.policy)
+            });
+        // Prefer packages which are a perfect match, over ones which are just a
+        // name match.
+        let ver_matching = matching.filter(DependencyDirection::Forward, |pkg| {
+            pkg.vet_version() == *version
+        });
+        let selected = if ver_matching.is_empty() {
+            info!("no version-match for '{package}'");
+            &matching
+        } else {
+            &ver_matching
+        };
+        if selected.is_empty() {
+            warn!("No third-party package named '{package}' exists, enabled features cannot be inferred");
+        }
+
+        // Invoke resolve_requirements to simulate multiple builds for this
+        // package.
+        let requirements = resolver::resolve_requirements(
+            &cfg.package_graph,
+            &store.config,
+            &criteria_mapper,
+            cfg.resolver_version,
+        );
+
+        // Combine all of the features for all selected packages, assuming all
+        // features used by any version in the selected set is enabled.
+        selected
+            .packages(DependencyDirection::Forward)
+            .flat_map(|package| requirements.get(package.id()))
+            .flat_map(|req| req.features.iter())
+            .map(|f| &f[..])
+            .collect()
+    };
+
+    let audit_graph = AuditGraph::build(store, &criteria_mapper, package, &features, None)
         .map_err(|_| miette!("This package has violation conflicts"))?;
 
     match audit_graph.search(
@@ -2803,7 +2877,14 @@ fn cmd_explain_audit(
         matching_packages[0].vet_version()
     };
 
-    do_cmd_explain_audit(out, &store, &sub_args.package, &version, &sub_args.criteria)
+    do_cmd_explain_audit(
+        out,
+        cfg,
+        &store,
+        &sub_args.package,
+        &version,
+        &sub_args.criteria,
+    )
 }
 
 fn cmd_fmt(_out: &Arc<dyn Out>, cfg: &Config, _sub_args: &FmtArgs) -> Result<(), miette::Report> {

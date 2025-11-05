@@ -299,7 +299,7 @@ impl Serialize for SerdeTriple {
     {
         self.triple.as_str().serialize(serializer)
     }
-    }
+}
 
 impl<'de> Deserialize<'de> for SerdeTriple {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -319,10 +319,69 @@ impl std::str::FromStr for SerdeTriple {
     }
 }
 
+/// Wrapper for `target_spec::TargetSpec` which makes the type implement various
+/// important traits, including `Ord`, `Serialize`, and `Deserialize`. Ordering
+/// is based on the string representation of the spec.
+#[derive(Debug, Clone)]
+pub struct SerdeTargetSpec {
+    pub target_spec: target_spec::TargetSpec,
+}
+
+impl SerdeTargetSpec {
+    fn as_str(&self) -> &str {
+        match &self.target_spec {
+            target_spec::TargetSpec::Expression(expr) => expr.expression_str(),
+            target_spec::TargetSpec::PlainString(plain) => plain.as_str(),
+        }
+    }
+}
+
+impl Serialize for SerdeTargetSpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.as_str().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SerdeTargetSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let target_spec = target_spec::TargetSpec::new(s).map_err(de::Error::custom)?;
+        Ok(SerdeTargetSpec { target_spec })
+    }
+}
+
+impl Ord for SerdeTargetSpec {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl PartialOrd for SerdeTargetSpec {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for SerdeTargetSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for SerdeTargetSpec {}
+
 pub mod audit {
     use super::*;
 
-    use crate::format::{AuditEntry, AuditKind, CriteriaName, Delta, VersionReq, VetVersion};
+    use crate::format::{
+        AuditEntry, AuditKind, CriteriaName, Delta, FeatureName, VersionReq, VetVersion,
+    };
 
     #[derive(Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -337,6 +396,14 @@ pub mod audit {
         version: Option<VetVersion>,
         delta: Option<Delta>,
         violation: Option<VersionReq>,
+        #[serde(rename = "exclude-targets")]
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
+        exclude_targets: Vec<SerdeTargetSpec>,
+        #[serde(rename = "exclude-features")]
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        #[serde(default)]
+        exclude_features: Vec<FeatureName>,
         importable: Option<bool>,
         notes: Option<String>,
         #[serde(rename = "aggregated-from")]
@@ -369,6 +436,8 @@ pub mod audit {
                 notes: val.notes,
                 criteria: val.criteria,
                 kind: kind?,
+                exclude_targets: val.exclude_targets,
+                exclude_features: val.exclude_features,
                 importable: val.importable.unwrap_or(true),
                 aggregated_from: val.aggregated_from,
                 // By default, always read entries as non-fresh. The import code
@@ -399,6 +468,8 @@ pub mod audit {
                 version,
                 delta,
                 violation,
+                exclude_targets: val.exclude_targets,
+                exclude_features: val.exclude_features,
                 importable: if val.importable { None } else { Some(false) },
                 aggregated_from: val.aggregated_from,
             }

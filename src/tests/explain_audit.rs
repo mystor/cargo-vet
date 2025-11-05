@@ -22,6 +22,7 @@ fn test_explain_audit_paths() {
     let output = BasicTestOutput::new();
     crate::do_cmd_explain_audit(
         &output.clone().as_dyn(),
+        &mock_cfg(&metadata),
         &store,
         "third-party",
         &ver(10),
@@ -63,6 +64,7 @@ fn test_explain_audit_unpublished() {
     let output = BasicTestOutput::new();
     crate::do_cmd_explain_audit(
         &output.clone().as_dyn(),
+        &mock_cfg(&metadata),
         &store,
         "descriptive",
         &ver(10),
@@ -97,6 +99,7 @@ fn test_explain_audit_wildcard() {
     let output = BasicTestOutput::new();
     crate::do_cmd_explain_audit(
         &output.clone().as_dyn(),
+        &mock_cfg(&metadata),
         &store,
         "transitive-third-party1",
         &ver(10),
@@ -128,6 +131,7 @@ fn test_explain_audit_incomplete() {
     let output = BasicTestOutput::new();
     crate::do_cmd_explain_audit(
         &output.clone().as_dyn(),
+        &mock_cfg(&metadata),
         &store,
         "third-party",
         &ver(10),

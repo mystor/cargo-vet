@@ -75,14 +75,15 @@ use crate::errors::SuggestError;
 use crate::format::{
     self, AuditEntry, AuditKind, AuditsFile, ConfigFile, CratesPublisher, CratesPublisherSource,
     CratesSourceId, CriteriaName, Delta, DiffStat, ExemptedDependency, FastMap, FastSet,
-    ImportName, ImportsFile, JsonPackage, JsonReport, JsonReportConclusion, JsonReportFailForVet,
-    JsonReportFailForViolationConflict, JsonReportSuccess, JsonSuggest, JsonSuggestItem,
-    JsonVetFailure, PackageName, PackageStr, Policy, UnpublishedEntry, VetVersion, WildcardEntry,
+    FeatureName, FeatureStr, ImportName, ImportsFile, JsonPackage, JsonReport,
+    JsonReportConclusion, JsonReportFailForVet, JsonReportFailForViolationConflict,
+    JsonReportSuccess, JsonSuggest, JsonSuggestItem, JsonVetFailure, PackageName, PackageStr,
+    Policy, UnpublishedEntry, VetVersion, WildcardEntry,
 };
 use crate::format::{SortedMap, SortedSet};
 use crate::network::Network;
 use crate::out::{progress_bar, IncProgressOnDrop, Out};
-use crate::serialization::SerdeTriple;
+use crate::serialization::{SerdeTargetSpec, SerdeTriple};
 use crate::storage::Cache;
 use crate::string_format::FormatShortList;
 use crate::{Config, PackageExt, Store};
@@ -125,7 +126,7 @@ pub struct FailForViolationConflict<'g> {
 #[derive(Debug)]
 pub struct FailForVet<'g> {
     /// These packages are to blame and need to be fixed
-    pub failures: Vec<(PackageMetadata<'g>, AuditFailure)>,
+    pub failures: Vec<(PackageMetadata<'g>, AuditFailure<'g>)>,
     pub suggest: Option<Suggest<'g>>,
 }
 
@@ -196,8 +197,9 @@ pub struct ResolveResult {
 }
 
 #[derive(Debug, Clone)]
-pub struct AuditFailure {
+pub struct AuditFailure<'g> {
     pub criteria_failures: CriteriaSet,
+    pub features: SortedSet<FeatureStr<'g>>,
 }
 
 /// Value indicating a failure to find a path in the audit graph between two nodes.
@@ -333,6 +335,29 @@ impl DeltaEdgeFreshness {
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd)]
+enum DeltaEdgeRestriction {
+    /// The edge has no restrictions, and audits the entirety of the given package.
+    Unrestricted,
+    /// The edge has target restrictions, but otherwise audits all features for the package.
+    TargetRestricted,
+    /// The edge has feature restrictions (not all features of the package have
+    /// been audited). It may also have target restrictions.
+    FeatureRestricted,
+}
+
+impl DeltaEdgeRestriction {
+    fn new(exclude_targets: &[SerdeTargetSpec], exclude_features: &[FeatureName]) -> Self {
+        if !exclude_features.is_empty() {
+            DeltaEdgeRestriction::FeatureRestricted
+        } else if !exclude_targets.is_empty() {
+            DeltaEdgeRestriction::TargetRestricted
+        } else {
+            DeltaEdgeRestriction::Unrestricted
+        }
+    }
+}
+
 /// A directed edge in the graph of audits. This may be forward or backwards,
 /// depending on if we're searching from "roots" (forward) or the target (backward).
 /// The source isn't included because that's implicit in the Node.
@@ -348,6 +373,9 @@ struct DeltaEdge<'a> {
     /// Whether or not the edge is a "fresh import", and should be
     /// de-prioritized to avoid unnecessary imports.lock updates.
     freshness: DeltaEdgeFreshness,
+    /// Whether or not the edge excludes specific features or platforms, and
+    /// should be de-prioritized.
+    restriction: DeltaEdgeRestriction,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -419,6 +447,13 @@ fn is_link_enabled(
     enabled != EnabledTernary::Disabled
 }
 
+/// Package-specific auditing requirements, including both the set of features
+/// enabled for the package, as well as the criteria enabled for the package.
+pub struct RequirementsSpec<'g> {
+    pub criteria: CriteriaSet,
+    pub features: SortedSet<FeatureStr<'g>>,
+}
+
 fn resolve_requirements_for_build<'g>(
     config_file: &ConfigFile,
     criteria_mapper: &CriteriaMapper,
@@ -426,7 +461,7 @@ fn resolve_requirements_for_build<'g>(
     platform: &PlatformSpec,
     resolver_version: CargoResolverVersion,
     dev_pass: bool,
-    out_requirements: &mut FastMap<&'g PackageId, CriteriaSet>,
+    out_requirements: &mut FastMap<&'g PackageId, RequirementsSpec<'g>>,
 ) {
     let _resolve_requirements_for_build = debug_span!(
         "resolve_requirements_for_build",
@@ -548,17 +583,27 @@ fn resolve_requirements_for_build<'g>(
             todo.package.id()
         );
 
-        // We're making progress, record the new required criteria for the
-        // package in `out_requirements` if the crate is third-party.
+        let feature_set = cargo_set.platform_features(build_platform);
+
+        // We're making progress, record the new required criteria and features
+        // for the package in `out_requirements` if the crate is third-party.
         // First party crates do not contribute to audit requirements.
         if todo.package.is_third_party(&config_file.policy) {
-            out_requirements
+            let spec = out_requirements
                 .entry(todo.package.id())
-                .or_insert_with(|| criteria_mapper.no_criteria())
-                .unioned_with(&self_criteria);
+                .or_insert_with(|| RequirementsSpec {
+                    criteria: criteria_mapper.no_criteria(),
+                    features: SortedSet::new(),
+                });
+            spec.criteria.unioned_with(&self_criteria);
+            // XXX: Should features be recorded here if self_criteria.is_empty()?
+            spec.features
+                .extend(todo.package.named_features().filter(|name| {
+                    feature_set
+                        .contains((todo.package.id(), FeatureLabel::Named(name)))
+                        .expect("package ID is valid")
+                }));
         }
-
-        let feature_set = cargo_set.platform_features(build_platform);
 
         // Check direct dependencies declared by this node, and add todo items
         // to process them with.
@@ -651,15 +696,27 @@ fn build_targets_to_platform_specs(build_targets: &Option<Vec<SerdeTriple>>) -> 
         .collect()
 }
 
-fn resolve_requirements<'g>(
+/// Check if the given `TargetSpec` (e.g. `cfg(windows)`) matches the given
+/// `PlatformSpec`.  If this is unknown (e.g. due to target features), `None`
+/// will be returned.
+fn target_spec_matches(target_spec: &TargetSpec, platform_spec: &PlatformSpec) -> Option<bool> {
+    match platform_spec {
+        PlatformSpec::Always => Some(true),
+        PlatformSpec::Any => Some(false),
+        PlatformSpec::Platform(platform) => target_spec.eval(platform),
+        _ => None, // PlatformSpec is non_exhaustive, treat other branches as unknown.
+    }
+}
+
+pub fn resolve_requirements<'g>(
     package_graph: &'g PackageGraph,
     config_file: &ConfigFile,
     criteria_mapper: &CriteriaMapper,
     resolver_version: CargoResolverVersion,
-) -> FastMap<&'g PackageId, CriteriaSet> {
+) -> FastMap<&'g PackageId, RequirementsSpec<'g>> {
     let _resolve_requirements = trace_span!("resolve_requirements").entered();
 
-    let mut requirements = FastMap::<&'g PackageId, CriteriaSet>::new();
+    let mut requirements = FastMap::<&'g PackageId, RequirementsSpec<'g>>::new();
 
     let workspace_set = package_graph.resolve_workspace();
 
@@ -709,7 +766,7 @@ fn resolve_audits<'g>(
     package_graph: &'g PackageGraph,
     store: &Store,
     criteria_mapper: &CriteriaMapper,
-    requirements: &FastMap<&'g PackageId, CriteriaSet>,
+    requirements: &FastMap<&'g PackageId, RequirementsSpec<'g>>,
 ) -> (FastMap<&'g PackageId, ResolveResult>, Conclusion<'g>) {
     let _resolve_audits = trace_span!("resolve_audits").entered();
     let mut violations = Vec::new();
@@ -725,16 +782,25 @@ fn resolve_audits<'g>(
             continue;
         }
 
-        let audit_graph = match AuditGraph::build(store, criteria_mapper, package.name(), None) {
+        let default_reqs = RequirementsSpec {
+            criteria: criteria_mapper.no_criteria(),
+            features: SortedSet::new(),
+        };
+        let required = requirements.get(package.id()).unwrap_or(&default_reqs);
+
+        let audit_graph = match AuditGraph::build(
+            store,
+            criteria_mapper,
+            package.name(),
+            &default_reqs.features,
+            None,
+        ) {
             Ok(audit_graph) => audit_graph,
             Err(violation) => {
                 violations.push((package, violation));
                 continue;
             }
         };
-
-        let no_criteria = criteria_mapper.no_criteria();
-        let required_criteria = requirements.get(package.id()).unwrap_or(&no_criteria);
 
         // NOTE: We currently always compute all search results even if we
         // only need those in `req_criteria` because some later passes using
@@ -753,7 +819,7 @@ fn resolve_audits<'g>(
         let mut needed_exemptions = false;
         let mut directly_exempted = false;
         let mut criteria_failures = criteria_mapper.no_criteria();
-        for criteria_idx in required_criteria.indices() {
+        for criteria_idx in required.criteria.indices() {
             match &search_results[criteria_idx] {
                 Ok(path) => {
                     needed_exemptions |= path
@@ -773,7 +839,13 @@ fn resolve_audits<'g>(
         }
 
         if !criteria_failures.is_empty() {
-            failures.push((package, AuditFailure { criteria_failures }));
+            failures.push((
+                package,
+                AuditFailure {
+                    criteria_failures,
+                    features: required.features.clone(),
+                },
+            ));
         }
 
         // XXX: Callers using these fields in success should perhaps be
@@ -823,8 +895,13 @@ impl<'a> AuditGraph<'a> {
         store: &'a Store,
         criteria_mapper: &CriteriaMapper,
         package: PackageStr<'_>,
+        features: &SortedSet<FeatureStr<'_>>,
         extra_audits_file: Option<&'a AuditsFile>,
     ) -> Result<Self, Vec<ViolationConflict>> {
+        // Determine the set of platforms which will be built on as PlatformSpecs
+        let platform_specs =
+            build_targets_to_platform_specs(&store.config.root_policy.build_targets);
+
         // Pre-build the namespaces for each audit so that we can take a reference
         // to each one as-needed rather than cloning the name each time.
         let foreign_namespaces: Vec<Option<ImportName>> = store
@@ -855,34 +932,53 @@ impl<'a> AuditGraph<'a> {
             );
 
         // Iterator over every normal audit.
-        let all_audits =
-            all_audits_files
-                .clone()
-                .flat_map(|(import_index, namespace, audits_file)| {
-                    audits_file
-                        .audits
-                        .get(package)
-                        .map(|v| &v[..])
-                        .unwrap_or(&[])
-                        .iter()
-                        .enumerate()
-                        .map(move |(audit_index, audit)| {
-                            (
-                                namespace,
-                                match import_index {
-                                    Some(import_index) => DeltaEdgeOrigin::ImportedAudit {
-                                        import_index,
-                                        audit_index,
-                                    },
-                                    None => DeltaEdgeOrigin::StoredLocalAudit {
-                                        audit_index,
-                                        importable: audit.importable,
-                                    },
+        let all_audits = all_audits_files
+            .clone()
+            .flat_map(|(import_index, namespace, audits_file)| {
+                audits_file
+                    .audits
+                    .get(package)
+                    .map(|v| &v[..])
+                    .unwrap_or(&[])
+                    .iter()
+                    .enumerate()
+                    .map(move |(audit_index, audit)| {
+                        (
+                            namespace,
+                            match import_index {
+                                Some(import_index) => DeltaEdgeOrigin::ImportedAudit {
+                                    import_index,
+                                    audit_index,
                                 },
-                                audit,
-                            )
-                        })
-                });
+                                None => DeltaEdgeOrigin::StoredLocalAudit {
+                                    audit_index,
+                                    importable: audit.importable,
+                                },
+                            },
+                            audit,
+                        )
+                    })
+            })
+            .filter(|(_, _, audit)| {
+                // If any of the used features are excluded, we can't use this
+                // edge, so ignore it when building the audit graph.
+                // FIXME: Consider improving diagnostics when there is an audit
+                // failure which could be healed by avoiding using a feature.
+                audit
+                    .exclude_features
+                    .iter()
+                    .all(|f| !features.contains(&f[..]))
+            })
+            .filter(|(_, _, audit)| {
+                // If an excluded target spec matches any of the platform_specs
+                // we're going to build with (interpreting ambiguity as
+                // matching), we can't use this audit.
+                audit.exclude_targets.iter().all(|excluded| {
+                    !platform_specs.iter().any(|spec| {
+                        target_spec_matches(&excluded.target_spec, spec).unwrap_or(true)
+                    })
+                })
+            });
 
         // Iterator over every wildcard audit.
         let all_wildcard_audits =
@@ -941,12 +1037,15 @@ impl<'a> AuditGraph<'a> {
 
             let criteria = criteria_mapper.criteria_from_list(&entry.criteria);
             let freshness = DeltaEdgeFreshness::new(entry.is_fresh_import, false);
+            let restriction =
+                DeltaEdgeRestriction::new(&entry.exclude_targets, &entry.exclude_features);
 
             forward_audits.entry(from_ver).or_default().push(DeltaEdge {
                 version: Some(to_ver),
                 criteria: criteria.clone(),
                 origin: origin.clone(),
                 freshness,
+                restriction,
             });
             backward_audits
                 .entry(Some(to_ver))
@@ -956,6 +1055,7 @@ impl<'a> AuditGraph<'a> {
                     criteria,
                     origin,
                     freshness,
+                    restriction,
                 });
         }
 
@@ -984,12 +1084,14 @@ impl<'a> AuditGraph<'a> {
                         criteria: criteria.clone(),
                         origin: origin.clone(),
                         freshness,
+                        restriction: DeltaEdgeRestriction::Unrestricted,
                     });
                     backward_audits.entry(to_ver).or_default().push(DeltaEdge {
                         version: from_ver,
                         criteria,
                         origin,
                         freshness,
+                        restriction: DeltaEdgeRestriction::Unrestricted,
                     });
                 }
             }
@@ -1014,12 +1116,14 @@ impl<'a> AuditGraph<'a> {
                         criteria: criteria.clone(),
                         origin: origin.clone(),
                         freshness,
+                        restriction: DeltaEdgeRestriction::Unrestricted,
                     });
                     backward_audits.entry(to_ver).or_default().push(DeltaEdge {
                         version: from_ver,
                         criteria,
                         origin,
                         freshness,
+                        restriction: DeltaEdgeRestriction::Unrestricted,
                     });
                 }
             }
@@ -1038,12 +1142,14 @@ impl<'a> AuditGraph<'a> {
                 criteria: criteria.clone(),
                 origin: origin.clone(),
                 freshness,
+                restriction: DeltaEdgeRestriction::Unrestricted,
             });
             backward_audits.entry(to_ver).or_default().push(DeltaEdge {
                 version: from_ver,
                 criteria,
                 origin,
                 freshness,
+                restriction: DeltaEdgeRestriction::Unrestricted,
             });
         }
 
@@ -1061,12 +1167,14 @@ impl<'a> AuditGraph<'a> {
                     criteria: criteria.clone(),
                     origin: origin.clone(),
                     freshness: DeltaEdgeFreshness::Stale,
+                    restriction: DeltaEdgeRestriction::Unrestricted,
                 });
                 backward_audits.entry(to_ver).or_default().push(DeltaEdge {
                     version: from_ver,
                     criteria,
                     origin,
                     freshness: DeltaEdgeFreshness::Stale,
+                    restriction: DeltaEdgeRestriction::Unrestricted,
                 });
             }
         }
@@ -1267,6 +1375,7 @@ fn search_for_path(
         origin_version: Option<&'a VetVersion>,
         path: Vec<DeltaEdgeOrigin>,
         caveat_level: CaveatLevel,
+        restriction_level: DeltaEdgeRestriction,
     }
 
     impl Node<'_> {
@@ -1286,6 +1395,7 @@ fn search_for_path(
             // we're going to visit every node).
             Reverse((
                 self.caveat_level,
+                self.restriction_level,
                 self.version,
                 self.exemption_origin_version(),
                 self.path.len(),
@@ -1334,6 +1444,7 @@ fn search_for_path(
         origin_version: from_version,
         path: Vec::new(),
         caveat_level: CaveatLevel::None,
+        restriction_level: DeltaEdgeRestriction::Unrestricted,
     });
 
     let mut visited = SortedSet::new();
@@ -1342,6 +1453,7 @@ fn search_for_path(
         origin_version: _,
         path,
         caveat_level,
+        restriction_level,
     }) = queue.pop()
     {
         // If We've been to a version before, We're not going to get a better
@@ -1405,6 +1517,7 @@ fn search_for_path(
                 origin_version: version,
                 path: path.iter().cloned().chain([edge.origin.clone()]).collect(),
                 caveat_level: caveat_level.max(edge_caveat_level),
+                restriction_level: restriction_level.max(edge.restriction),
             });
         }
 
@@ -1424,6 +1537,7 @@ fn search_for_path(
                     }])
                     .collect(),
                 caveat_level: caveat_level.max(CaveatLevel::FreshExemption),
+                restriction_level,
             })
         }
     }
@@ -1616,6 +1730,7 @@ impl ResolveReport<'_> {
                                 &store,
                                 &self.criteria_mapper,
                                 package.name(),
+                                &audit_failure.features,
                                 Some(audits),
                             )
                             .ok()?;
@@ -2491,13 +2606,16 @@ async fn suggest_delta(
 fn resolve_package_required_entries(
     package_graph: &PackageGraph,
     criteria_mapper: &CriteriaMapper,
-    requirements: &FastMap<&PackageId, CriteriaSet>,
+    requirements: &FastMap<&PackageId, RequirementsSpec<'_>>,
     store: &Store,
     package_name: PackageStr<'_>,
     search_mode: SearchMode,
 ) -> Option<SortedMap<RequiredEntry, CriteriaSet>> {
     // Collect the list of third-party packages with the given name, along with their requirements.
-    let no_criteria = criteria_mapper.no_criteria();
+    let default_reqs = RequirementsSpec {
+        criteria: criteria_mapper.no_criteria(),
+        features: SortedSet::new(),
+    };
     let packages: Vec<_> = package_graph
         .resolve_package_name(package_name)
         .packages(DependencyDirection::Forward)
@@ -2505,7 +2623,7 @@ fn resolve_package_required_entries(
         .map(|package| {
             (
                 package,
-                requirements.get(package.id()).unwrap_or(&no_criteria),
+                requirements.get(package.id()).unwrap_or(&default_reqs),
             )
         })
         .collect();
@@ -2515,18 +2633,21 @@ fn resolve_package_required_entries(
         return Some(SortedMap::new());
     }
 
-    let Ok(audit_graph) = AuditGraph::build(store, criteria_mapper, package_name, None) else {
-        // There were violations when building the audit graph, return `None` to
-        // indicate that this package is failing.
-        return None;
-    };
-
     let mut required_entries = SortedMap::new();
     for &(package, reqs) in &packages {
         let version = package.vet_version();
+
+        let Ok(audit_graph) =
+            AuditGraph::build(store, criteria_mapper, package_name, &reqs.features, None)
+        else {
+            // There were violations when building the audit graph, return `None` to
+            // indicate that this package is failing.
+            return None;
+        };
+
         // Do the minimal set of searches to validate that the required criteria
         // are matched.
-        for criteria_idx in criteria_mapper.minimal_indices(reqs) {
+        for criteria_idx in criteria_mapper.minimal_indices(&reqs.criteria) {
             let Ok(path) = audit_graph.search(criteria_idx, &version, search_mode) else {
                 // This package failed to vet, return `None`.
                 return None;

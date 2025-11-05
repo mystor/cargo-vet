@@ -3,7 +3,9 @@
 use crate::cli::FetchMode;
 use crate::errors::{StoreVersionParseError, VersionParseError};
 use crate::resolver::{DiffRecommendation, ViolationConflict};
-use crate::serialization::{spanned::Spanned, CacheFileVersion, SerdeTriple, Tidyable};
+use crate::serialization::{
+    spanned::Spanned, CacheFileVersion, SerdeTargetSpec, SerdeTriple, Tidyable,
+};
 use crate::{flock::Filesystem, serialization};
 use core::{cmp, fmt};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -52,9 +54,14 @@ impl core::ops::Deref for VersionReq {
         &self.0
     }
 }
+impl cmp::Ord for VersionReq {
+    fn cmp(&self, other: &VersionReq) -> cmp::Ordering {
+        format!("{self}").cmp(&format!("{other}"))
+    }
+}
 impl cmp::PartialOrd for VersionReq {
     fn partial_cmp(&self, other: &VersionReq) -> Option<cmp::Ordering> {
-        format!("{self}").partial_cmp(&format!("{other}"))
+        Some(self.cmp(other))
     }
 }
 impl VersionReq {
@@ -297,13 +304,17 @@ pub struct CriteriaEntry {
 }
 
 /// This is conceptually an enum
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+// NOTE: The members in `AuditEntry` are sorted for the `Ord`/`PartialOrd`
+// implementation, as serialization order is defined by `AuditEntryAll`.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(try_from = "serialization::audit::AuditEntryAll")]
 #[serde(into = "serialization::audit::AuditEntryAll")]
 pub struct AuditEntry {
+    pub kind: AuditKind,
     pub who: Vec<Spanned<String>>,
     pub criteria: Vec<Spanned<CriteriaName>>,
-    pub kind: AuditKind,
+    pub exclude_targets: Vec<SerdeTargetSpec>,
+    pub exclude_features: Vec<FeatureName>,
     pub importable: bool,
     pub notes: Option<String>,
     /// Chain of sources this audit was aggregated from, most recent last.
@@ -324,7 +335,10 @@ impl AuditEntry {
     pub fn same_audit_as(&self, other: &AuditEntry) -> bool {
         // Ignore `who` and `notes` for comparison, as they are not relevant
         // semantically and might have been updated uneventfully.
-        self.kind == other.kind && self.criteria == other.criteria
+        self.kind == other.kind
+            && self.criteria == other.criteria
+            && self.exclude_targets == other.exclude_targets
+            && self.exclude_features == other.exclude_features
     }
 
     /// Try to collapse this (delta) entry with the given entry, which must be just prior to it
@@ -352,7 +366,10 @@ impl AuditEntry {
         }
 
         // TODO should this use a criteria mapper to avoid different orderings?
-        if other.criteria != self.criteria {
+        if other.criteria != self.criteria
+            || other.exclude_targets != self.exclude_targets
+            || other.exclude_features != self.exclude_features
+        {
             return None;
         }
 
@@ -393,27 +410,7 @@ impl AuditEntry {
     }
 }
 
-/// Implement PartialOrd manually because the order we want for sorting is
-/// different than the order we want for serialization.
-///
-/// Strictly speaking Ord and PartialOrd implementations are supposed to agree,
-/// and clippy recently started complaining about this. We should consider whether
-/// there's another solution to this problem.
-#[allow(clippy::non_canonical_partial_ord_impl)]
-impl cmp::PartialOrd for AuditEntry {
-    fn partial_cmp<'a>(&'a self, other: &'a AuditEntry) -> Option<cmp::Ordering> {
-        let tuple = |x: &'a AuditEntry| (&x.kind, &x.criteria, &x.who, &x.notes);
-        tuple(self).partial_cmp(&tuple(other))
-    }
-}
-
-impl cmp::Ord for AuditEntry {
-    fn cmp(&self, other: &AuditEntry) -> cmp::Ordering {
-        self.partial_cmp(other).unwrap()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum AuditKind {
     Full { version: VetVersion },
     Delta { from: VetVersion, to: VetVersion },
